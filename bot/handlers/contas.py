@@ -87,10 +87,10 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return ConversationHandler.END
 
-    elif result == "error:rate_limit":
+    elif result in ("error:rate_limit", "error:rate_limit_429"):
         await update.message.reply_text(
             f"⏳ Instagram pedindo espera para *@{username}*.\n"
-            f"Tente em 10-15 minutos.", parse_mode="Markdown")
+            f"⏳ Aguarde 30-60 minutos antes de tentar novamente." if "429" in result else f"Tente em 10-15 minutos.", parse_mode="Markdown")
         return ConversationHandler.END
 
     elif result == "error:feedback_required":
