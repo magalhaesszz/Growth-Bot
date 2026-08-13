@@ -67,12 +67,14 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    # Dashboard primeiro — tem handler de texto genérico (on_dashboard_text)
-    # que deve ficar por último para não capturar mensagens dos outros handlers
+    # Dashboard registrado PRIMEIRO — garante que /start e CallbackQuery
+    # com prefixo "dash:" sejam capturados antes dos ConversationHandlers
+    register_dashboard_handlers(app)
+
+    # Demais handlers registrados depois
     register_contas_handlers(app)
     register_operacoes_handlers(app)
     register_video_handlers(app)
-    register_dashboard_handlers(app)  # /start + botões inline + texto livre
 
     logger.info("Bot rodando.")
     app.run_polling(drop_pending_updates=True)

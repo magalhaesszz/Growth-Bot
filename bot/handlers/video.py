@@ -342,6 +342,7 @@ def register_video_handlers(app):
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_user=True,
+        per_message=False,
     ))
 
     # Conversa /video (único)
@@ -354,6 +355,7 @@ def register_video_handlers(app):
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_user=True,
+        per_message=False,
     ))
 
     # Conversa /video_lote
@@ -367,6 +369,7 @@ def register_video_handlers(app):
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_user=True,
+        per_message=False,
     ))
 
     # Comandos simples
