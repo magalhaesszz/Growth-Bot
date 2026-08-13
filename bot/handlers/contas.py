@@ -2,7 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import (
     ContextTypes, CommandHandler, MessageHandler,
-    ConversationHandler, filters
+    ConversationHandler, filters,
 )
 
 from database.accounts import AccountsDB
@@ -12,21 +12,22 @@ from config import TELEGRAM_OWNER_ID, WARMUP_SCHEDULE
 logger = logging.getLogger(__name__)
 accounts_db = AccountsDB()
 
-# Estados da conversa de verificação
+# Estados da conversa
 AGUARDANDO_CODIGO = 1
+AGUARDANDO_2FA    = 2
 
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != TELEGRAM_OWNER_ID:
             await update.message.reply_text("⛔ Acesso negado.")
-            return
+            return ConversationHandler.END
         return await func(update, ctx)
     wrapper.__name__ = func.__name__
     return wrapper
 
 
-# ─── /conta_add com suporte a challenge ──────────────────────
+# ─── /conta_add ──────────────────────────────────────────────
 
 async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_OWNER_ID:
@@ -34,132 +35,197 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if len(ctx.args) < 2:
-        await update.message.reply_text("Uso: /conta_add @usuario senha")
+        await update.message.reply_text(
+            "Uso: `/conta_add @usuario senha`",
+            parse_mode="Markdown"
+        )
         return ConversationHandler.END
 
     username = ctx.args[0].lstrip("@")
     password = ctx.args[1]
 
-    await update.message.reply_text(f"🔄 Conectando @{username}...")
+    ctx.user_data["challenge_username"] = username
+    ctx.user_data["challenge_password"] = password
+
+    await update.message.reply_text(f"🔄 Conectando *@{username}*...", parse_mode="Markdown")
+
+    # Login em thread separada para não bloquear o event loop
+    import asyncio
+    loop = asyncio.get_event_loop()
 
     ig = InstagramClient(username, password)
-    result = ig.login()
+
+    # Executa o login em thread separada (pode bloquear aguardando challenge)
+    result = await loop.run_in_executor(None, ig.login)
 
     if result == "ok":
-        # Salva conta e sessão
-        existing = accounts_db.get_account(username)
-        if not existing:
-            accounts_db.add_account(username, password, ig._fingerprint)
-        session_data = ig.get_session_data()
-        if session_data:
-            accounts_db.save_session_backup(username, session_data)
-
+        _salvar_conta(ig, username, password)
         schedule_str = " → ".join(str(n) for n in WARMUP_SCHEDULE)
         await update.message.reply_text(
-            f"✅ *@{username}* conectada!\n"
+            f"✅ *@{username}* conectada com sucesso!\n"
             f"🔥 Aquecimento: {schedule_str} follows/dia\n"
-            f"Fingerprint: *{ig._fingerprint.get('device', 'n/a')}*",
+            f"📱 Fingerprint: *{ig._fingerprint.get('device', 'n/a')}*",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
 
     elif result == "challenge":
-        # Guarda username no contexto para usar na próxima mensagem
-        ctx.user_data["challenge_username"] = username
-        ctx.user_data["challenge_password"] = password
-
+        # O _telegram_code_handler já está bloqueando em outra thread
+        # aguardando o código — precisamos pedí-lo ao usuário
+        ctx.user_data["challenge_ig"] = ig
         await update.message.reply_text(
-            f"📱 *Verificação necessária para @{username}*\n\n"
-            f"O Instagram enviou um código de confirmação para o *e-mail ou SMS* cadastrado na conta.\n\n"
-            f"Digite o código abaixo:",
+            f"📱 *Verificação necessária — @{username}*\n\n"
+            f"O Instagram enviou um código de verificação para o\n"
+            f"*e-mail ou SMS* cadastrado na conta.\n\n"
+            f"✏️ Digite o código de 6 dígitos abaixo:\n\n"
+            f"_Use /cancelar para cancelar._",
             parse_mode="Markdown"
         )
         return AGUARDANDO_CODIGO
 
+    elif result == "two_factor":
+        ctx.user_data["challenge_ig"] = ig
+        await update.message.reply_text(
+            f"🔐 *2FA ativo — @{username}*\n\n"
+            f"Digite o código do seu aplicativo autenticador:",
+            parse_mode="Markdown"
+        )
+        return AGUARDANDO_2FA
+
     elif result == "error:bad_password":
         await update.message.reply_text(
             f"❌ *Senha incorreta* para @{username}.\n"
-            f"Verifique e tente novamente.",
+            f"Verifique e tente novamente com `/conta_add @{username} senha_correta`",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
 
     elif result == "error:rate_limit":
         await update.message.reply_text(
-            f"⏳ O Instagram está pedindo espera para @{username}.\n"
+            f"⏳ Instagram pedindo espera para *@{username}*.\n"
             f"Tente novamente em 10-15 minutos.",
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
 
-    elif result == "error:invalid_user":
-        await update.message.reply_text(f"❌ Usuário @{username} não encontrado.")
+    elif result == "error:feedback_required":
+        await update.message.reply_text(
+            f"⚠️ Instagram bloqueou *@{username}* temporariamente.\n"
+            f"Acesse o app pelo celular e confirme sua identidade, depois tente de novo.",
+            parse_mode="Markdown"
+        )
         return ConversationHandler.END
 
     else:
         await update.message.reply_text(
-            f"❌ Erro ao conectar @{username}:\n`{result}`\n\n"
+            f"❌ Erro ao conectar *@{username}*:\n`{result}`\n\n"
             f"Se o Instagram pediu verificação, acesse o app pelo celular primeiro.",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
 
 
+# ─── Receber código de verificação ───────────────────────────
+
 async def receber_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Recebe o código de verificação digitado pelo usuário."""
     if update.effective_user.id != TELEGRAM_OWNER_ID:
         return ConversationHandler.END
 
     code = update.message.text.strip()
     username = ctx.user_data.get("challenge_username")
-    password = ctx.user_data.get("challenge_password")
+    ig: InstagramClient = ctx.user_data.get("challenge_ig")
 
-    if not username:
+    if not username or not ig:
         await update.message.reply_text("❌ Sessão expirada. Use /conta_add novamente.")
         return ConversationHandler.END
 
-    await update.message.reply_text(f"🔄 Verificando código para @{username}...")
+    if not code.isdigit() or len(code) < 4:
+        await update.message.reply_text("❌ Código inválido. Digite apenas os números (ex: 123456).")
+        return AGUARDANDO_CODIGO
 
-    # Recupera o cliente que está com challenge pendente
-    ig = PENDING_CHALLENGES.get(username)
-    if not ig:
-        # Reconstrói se não estiver em memória
-        ig = InstagramClient(username, password)
-        ig.login()
+    await update.message.reply_text(f"🔄 Verificando código para *@{username}*...", parse_mode="Markdown")
 
-    success = ig.submit_challenge_code(code)
+    # Injeta o código no handler que está aguardando em outra thread
+    sucesso = ig.submit_code(code)
 
-    if success:
-        existing = accounts_db.get_account(username)
-        if not existing:
-            accounts_db.add_account(username, password, ig._fingerprint)
-        session_data = ig.get_session_data()
-        if session_data:
-            accounts_db.save_session_backup(username, session_data)
+    if sucesso:
+        # Aguarda o login completar (o challenge_flow vai terminar em breve)
+        import asyncio, time
+        await asyncio.sleep(3)
 
-        schedule_str = " → ".join(str(n) for n in WARMUP_SCHEDULE)
-        await update.message.reply_text(
-            f"✅ *@{username}* verificada e conectada!\n"
-            f"🔥 Aquecimento: {schedule_str} follows/dia",
-            parse_mode="Markdown"
-        )
+        # Verifica se logou
+        if ig.is_logged_in():
+            _salvar_conta(ig, username, ctx.user_data.get("challenge_password", ""))
+            schedule_str = " → ".join(str(n) for n in WARMUP_SCHEDULE)
+            await update.message.reply_text(
+                f"✅ *@{username}* verificada e conectada!\n"
+                f"🔥 Aquecimento: {schedule_str} follows/dia",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Código enviado mas login não confirmado para *@{username}*.\n"
+                f"Tente `/conta_add @{username} senha` novamente.",
+                parse_mode="Markdown"
+            )
     else:
         await update.message.reply_text(
-            f"❌ Código inválido ou expirado.\n"
-            f"Use /conta_add @{username} senha para tentar novamente."
+            f"❌ Código inválido ou expirado para *@{username}*.\n"
+            f"Tente `/conta_add @{username} senha` para solicitar um novo código.",
+            parse_mode="Markdown"
         )
 
-    ctx.user_data.pop("challenge_username", None)
-    ctx.user_data.pop("challenge_password", None)
-    return ConversationHandler.END
-
-
-async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Conexão cancelada.")
     ctx.user_data.clear()
     return ConversationHandler.END
 
 
-# ─── Demais comandos de conta ─────────────────────────────────
+# ─── Receber código 2FA ───────────────────────────────────────
+
+async def receber_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_OWNER_ID:
+        return ConversationHandler.END
+
+    code = update.message.text.strip()
+    username = ctx.user_data.get("challenge_username")
+    ig: InstagramClient = ctx.user_data.get("challenge_ig")
+
+    if not username or not ig:
+        await update.message.reply_text("❌ Sessão expirada. Use /conta_add novamente.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"🔄 Verificando 2FA para *@{username}*...", parse_mode="Markdown")
+
+    sucesso = ig.submit_2fa(code)
+
+    if sucesso:
+        _salvar_conta(ig, username, ctx.user_data.get("challenge_password", ""))
+        await update.message.reply_text(
+            f"✅ *@{username}* com 2FA conectada!",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Código 2FA incorreto para *@{username}*.\n"
+            f"Tente novamente ou use `/conta_add @{username} senha`.",
+            parse_mode="Markdown"
+        )
+
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─── Helper para salvar conta ────────────────────────────────
+
+def _salvar_conta(ig: InstagramClient, username: str, password: str):
+    existing = accounts_db.get_account(username)
+    if not existing:
+        accounts_db.add_account(username, password, ig._fingerprint)
+    session_data = ig.get_session_data()
+    if session_data:
+        accounts_db.save_session_backup(username, session_data)
+
+
+# ─── Demais comandos ─────────────────────────────────────────
 
 @owner_only
 async def cmd_conta_lista(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -249,19 +315,30 @@ async def cmd_conta_fingerprint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    username = ctx.user_data.get("challenge_username", "")
+    PENDING_CHALLENGES.pop(username, None)
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ Operação cancelada.")
+    return ConversationHandler.END
+
+
 # ─── Registro ────────────────────────────────────────────────
 
 def register_contas_handlers(app):
-    # ConversationHandler para /conta_add com fluxo de verificação
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("conta_add", cmd_conta_add)],
         states={
             AGUARDANDO_CODIGO: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receber_codigo),
             ],
+            AGUARDANDO_2FA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receber_2fa),
+            ],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_user=True,
+        per_message=False,
     )
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("conta_lista",       cmd_conta_lista))
