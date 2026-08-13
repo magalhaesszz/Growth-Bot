@@ -1022,8 +1022,10 @@ async def _handle_config_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 
 def register_dashboard_handlers(app):
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(on_dashboard_button, pattern=r"^dash:"))
+    # group=-1 garante que /start e dash:* callbacks têm prioridade
+    # maxima sobre ConversationHandlers (group=0)
+    app.add_handler(CommandHandler("start", cmd_start), group=-1)
+    app.add_handler(CallbackQueryHandler(on_dashboard_button, pattern=r"^dash:"), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_dashboard_text))
     app.add_handler(
         MessageHandler(
