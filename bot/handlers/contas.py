@@ -1,3 +1,4 @@
+import json
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -325,6 +326,35 @@ async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Registro ────────────────────────────────────────────────
 
+
+@owner_only
+async def cmd_conta_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Testa o login e mostra a resposta bruta do Instagram para diagnóstico."""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Uso: /conta_debug @usuario senha")
+        return
+
+    username = ctx.args[0].lstrip("@")
+    password = ctx.args[1]
+
+    await update.message.reply_text(f"🔍 Testando login de @{username}...")
+
+    import asyncio
+    from instagram.client import InstagramClient, PENDING_CHALLENGES
+
+    ig = InstagramClient(username, password)
+    try:
+        ig.cl.login(username, password)
+        await update.message.reply_text("✅ Login direto funcionou! Use /conta_add normalmente.")
+    except Exception as e:
+        last = ig.cl.last_json or {}
+        msg = (
+            f"❌ Erro: `{type(e).__name__}: {e}`\n\n"
+            f"Resposta do Instagram:\n"
+            f"`{json.dumps(last, ensure_ascii=False)[:800]}`"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
 def register_contas_handlers(app):
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("conta_add", cmd_conta_add)],
@@ -347,3 +377,4 @@ def register_contas_handlers(app):
     app.add_handler(CommandHandler("conta_remover",     cmd_conta_remover))
     app.add_handler(CommandHandler("conta_aquecer",     cmd_conta_aquecer))
     app.add_handler(CommandHandler("conta_fingerprint", cmd_conta_fingerprint))
+    app.add_handler(CommandHandler("conta_debug",       cmd_conta_debug))
