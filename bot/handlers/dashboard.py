@@ -176,10 +176,12 @@ def _video_status_text() -> str:
 def _usuarios_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_button("Ver todos", "dash:usuarios:lista"),
-         _button("Adicionar", "dash:usuarios:add")],
-        [_button("Remover", "dash:usuarios:remove"),
-         _button("Detalhes", "dash:usuarios:detalhes")],
-        [_button("Voltar", "dash:home"), _button("Atualizar", "dash:usuarios")],
+         _button("Adicionar usuario", "dash:usuarios:add")],
+        [_button("Add admin 👑", "dash:usuarios:add_admin"),
+         _button("Remover", "dash:usuarios:remove")],
+        [_button("Detalhes", "dash:usuarios:detalhes"),
+         _button("Recarregar", "dash:usuarios:reload")],
+        [_button("Voltar", "dash:home")],
     ])
 
 def _safe(value, default="-"):
@@ -427,9 +429,18 @@ def _report_text(ctx: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 async def _show(update: Update, text: str, keyboard: InlineKeyboardMarkup | None = None):
+    from telegram.error import BadRequest
     keyboard = keyboard or _back_keyboard()
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                # Se nao for "message not modified", tentar enviar nova mensagem
+                try:
+                    await update.callback_query.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+                except Exception:
+                    pass
     else:
         await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -587,21 +598,64 @@ def _parse_pair(text: str, first: str, second: str) -> tuple[int, int]:
 
 # ─── Gerenciamento de usuarios ───────────────────────────
 
+# Usuarios autorizados — persistidos no Supabase
+# Estrutura: {user_id: {"username": str, "name": str, "added_at": str, "is_admin": bool}}
 _ALLOWED_USERS: dict[int, dict] = {}
 
 
+def _load_usuarios():
+    """Carrega usuarios do Supabase para memoria."""
+    try:
+        from database.operations import DB
+        db = DB()
+        rows = db.sb.table("bot_users").select("*").execute().data or []
+        _ALLOWED_USERS.clear()
+        for r in rows:
+            _ALLOWED_USERS[r["user_id"]] = {
+                "username": r.get("username", "?"),
+                "name": r.get("name", "?"),
+                "added_at": r.get("added_at", "?"),
+                "is_admin": r.get("is_admin", False),
+            }
+    except Exception as e:
+        logger.warning(f"Nao foi possivel carregar usuarios: {e}")
+
+
+def _save_usuario(user_id: int, data: dict):
+    """Salva ou atualiza usuario no Supabase."""
+    try:
+        from database.operations import DB
+        db = DB()
+        db.sb.table("bot_users").upsert({"user_id": user_id, **data}).execute()
+    except Exception as e:
+        logger.warning(f"Nao foi possivel salvar usuario: {e}")
+
+
+def _delete_usuario(user_id: int):
+    """Remove usuario do Supabase."""
+    try:
+        from database.operations import DB
+        db = DB()
+        db.sb.table("bot_users").delete().eq("user_id", user_id).execute()
+    except Exception as e:
+        logger.warning(f"Nao foi possivel remover usuario: {e}")
+
+
 def _usuarios_text() -> str:
+    _load_usuarios()
     if not _ALLOWED_USERS:
         return "*Usuarios autorizados*\n\nNenhum usuario cadastrado ainda."
     lines = ["*Usuarios autorizados:*\n"]
     for uid, info in _ALLOWED_USERS.items():
-        name = info.get("username") or info.get("name") or str(uid)
-        lines.append(f"\u2022 @{name} (`{uid}`) \u2014 desde {info.get('added_at','?')} ")
+        name = info.get("username") or str(uid)
+        admin = " 👑" if info.get("is_admin") else ""
+        lines.append(f"\u2022 @{name} (`{uid}`){admin} \u2014 {info.get('added_at','?')} ")
     return "\n".join(lines)
 
 
 async def _handle_usuarios(update, ctx, data: str):
-    if data in ("dash:usuarios", "dash:usuarios:lista"):
+    if data in ("dash:usuarios", "dash:usuarios:lista", "dash:usuarios:reload"):
+        _load_usuarios()
         await _show(update, _usuarios_text(), _usuarios_keyboard())
     elif data == "dash:usuarios:add":
         _prompt(ctx, "usuarios_add")
@@ -620,14 +674,22 @@ async def _handle_usuarios(update, ctx, data: str):
         await _show(update,
             f"*Remover usuario*\n\n{lista}\n\nEnvie o ID numerico:",
             InlineKeyboardMarkup([[_button("Cancelar", "dash:usuarios")]]))
+    elif data == "dash:usuarios:add_admin":
+        ctx.user_data["usuarios_is_admin"] = True
+        _prompt(ctx, "usuarios_add")
+        await _show(update,
+            "*Adicionar Admin \U0001f451*\n\nEnvie o ID numerico do novo administrador:",
+            InlineKeyboardMarkup([[_button("Cancelar", "dash:usuarios")]]))
     elif data == "dash:usuarios:detalhes":
+        _load_usuarios()
         if not _ALLOWED_USERS:
-            await _show(update, "Nenhum usuario.", _usuarios_keyboard())
+            await _show(update, "Nenhum usuario cadastrado.", _usuarios_keyboard())
             return
-        lines = ["*Detalhes:*\n"]
+        lines = ["*Detalhes dos usuarios:*\n"]
         for uid, info in _ALLOWED_USERS.items():
+            admin = " \U0001f451 Admin" if info.get("is_admin") else ""
             lines.append(
-                f"\U0001f464 @{info.get('username','?')}\n"
+                f"\U0001f464 @{info.get('username',uid)}{admin}\n"
                 f"   ID: `{uid}`\n"
                 f"   Desde: {info.get('added_at','?')}\n"
             )
@@ -639,39 +701,62 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
     msg = update.message
     text = text.lstrip("@").strip()
     if action == "usuarios_add":
-        if text.isdigit():
-            uid = int(text)
-            _ALLOWED_USERS[uid] = {
-                "name": "?", "username": text,
-                "added_at": datetime.now().strftime("%d/%m/%Y")
-            }
-            await msg.reply_text(f"\u2705 Usuario `{uid}` autorizado.", parse_mode="Markdown")
-        else:
+        if not text.isdigit():
             await msg.reply_text(
                 "\u26a0\ufe0f Envie o *ID numerico* do usuario.\n"
-                "Para descobrir, peca ao usuario enviar /start no bot.",
+                "Para saber o ID, peca ao usuario enviar /start no bot e veja nos logs.",
                 parse_mode="Markdown")
+            return
+        uid = int(text)
+        is_admin = ctx.user_data.pop("usuarios_is_admin", False)
+        data = {
+            "username": str(uid), "name": "?",
+            "added_at": datetime.now().strftime("%d/%m/%Y"),
+            "is_admin": is_admin,
+        }
+        _ALLOWED_USERS[uid] = data
+        _save_usuario(uid, data)
+        tipo = "Admin" if is_admin else "Usuario"
+        await msg.reply_text(
+            f"\u2705 {tipo} `{uid}` autorizado com sucesso!",
+            parse_mode="Markdown")
+    elif action == "usuarios_add_admin":
+        ctx.user_data["usuarios_is_admin"] = True
+        ctx.user_data["dashboard_pending"] = "usuarios_add"
+        await msg.reply_text(
+            "Envie o ID numerico do novo *admin*:",
+            parse_mode="Markdown")
+        return
     elif action == "usuarios_remove":
-        if text.isdigit() and int(text) in _ALLOWED_USERS:
-            info = _ALLOWED_USERS.pop(int(text))
+        if not text.isdigit():
+            await msg.reply_text("Envie o ID numerico.")
+            return
+        uid = int(text)
+        if uid in _ALLOWED_USERS:
+            info = _ALLOWED_USERS.pop(uid)
+            _delete_usuario(uid)
             await msg.reply_text(
-                f"\U0001f5d1 Usuario @{info.get('username','?')} removido.",
+                f"\U0001f5d1 @{info.get('username',uid)} removido.",
                 parse_mode="Markdown")
         else:
-            await msg.reply_text("ID nao encontrado.")
+            await msg.reply_text(f"ID `{uid}` nao encontrado.", parse_mode="Markdown")
     ctx.user_data.pop("dashboard_pending", None)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
-    if user.id != TELEGRAM_OWNER_ID:
+    # Verificar se e admin ou usuario autorizado
+    _load_usuarios()
+    is_authorized = (user.id == TELEGRAM_OWNER_ID) or user.id in _ALLOWED_USERS
+    if not is_authorized:
+        logger.info(f"Acesso negado — user_id: {user.id}, username: @{user.username}")
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("\U0001f4e9 Falar com o admin", url="https://t.me/thsistem7")
         ]])
         await update.message.reply_text(
             "\U0001f512 *Acesso Privado*\n\n"
-            "Este bot \xe9 de uso exclusivo e n\xe3o est\xe1 dispon\xedvel publicamente.\n\n"
+            "Este bot e de uso exclusivo e nao esta disponivel publicamente.\n\n"
             "Caso tenha interesse em uma ferramenta similar, entre em contato com o administrador.",
             reply_markup=kb,
             parse_mode="Markdown"
