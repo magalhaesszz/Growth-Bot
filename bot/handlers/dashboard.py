@@ -737,8 +737,21 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
         _ALLOWED_USERS[uid] = data
         _save_usuario(uid, data)
         tipo = "Admin \U0001f451" if is_admin else "Usuario"
+        # Notificar o usuario automaticamente
+        try:
+            await msg.get_bot().send_message(
+                chat_id=uid,
+                text=(
+                    "\u2705 *Voce foi autorizado no Growth Bot!*\n\n"
+                    "Use /start para abrir o painel de controle."
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass  # usuario pode nao ter iniciado conversa com o bot ainda
         await msg.reply_text(
-            f"\u2705 {tipo} @{username_real} (`{uid}`) autorizado!",
+            f"\u2705 {tipo} @{username_real} (`{uid}`) autorizado!\n"
+            f"Notificacao enviada para ele automaticamente.",
             parse_mode="Markdown")
     elif action == "usuarios_add_admin":
         ctx.user_data["usuarios_is_admin"] = True
