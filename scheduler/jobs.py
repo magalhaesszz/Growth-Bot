@@ -63,7 +63,8 @@ async def run_follow_job():
             continue
 
         ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
-        if not ig.login():
+        result = ig.login()
+        if result != "ok":
             await _notify(f"❌ Falha de login — *@{username}*. Verifique as credenciais.")
             continue
 
@@ -153,7 +154,8 @@ async def run_unfollow_job():
             continue
 
         ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
-        if not ig.login():
+        result = ig.login()
+        if result != "ok":
             continue
 
         wl = WhitelistFilter(db.get_whitelist(acc["id"]))

@@ -51,7 +51,7 @@ async def cmd_alvo_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from instagram.client import InstagramClient
     from instagram.scraper import Scraper
     ig = InstagramClient(acc["username"], acc["password"])
-    ig.login()
+    result_login = ig.login()
     page = Scraper(ig).resolve_page(url)
     if not page:
         await update.message.reply_text("❌ Página não encontrada no Instagram.")

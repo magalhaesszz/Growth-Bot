@@ -4,13 +4,19 @@ import random
 import logging
 from pathlib import Path
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, ChallengeRequired
+from instagrapi.exceptions import (
+    LoginRequired,
+    PleaseWaitFewMinutes,
+    ChallengeRequired,
+    BadPassword,
+    InvalidUserError,
+    UserNotFound,
+)
 
 from config import SESSIONS_DIR
 
 logger = logging.getLogger(__name__)
 
-# ─── Fingerprints realistas de dispositivos Android ──────────
 DEVICE_POOL = [
     {
         "app_version": "269.0.0.18.75",
@@ -50,6 +56,9 @@ DEVICE_POOL = [
     },
 ]
 
+# Estado global de challenges pendentes: {username: InstagramClient}
+PENDING_CHALLENGES: dict[str, "InstagramClient"] = {}
+
 
 class InstagramClient:
     def __init__(self, username: str, password: str, device_fingerprint: dict = None):
@@ -58,6 +67,7 @@ class InstagramClient:
         self.session_path = Path(SESSIONS_DIR) / f"{username}.json"
         self.cl = Client()
         self._fingerprint = device_fingerprint or random.choice(DEVICE_POOL)
+        self._challenge_pending = False
         self._apply_fingerprint()
 
     # ─── Fingerprint ─────────────────────────────────────────
@@ -67,70 +77,139 @@ class InstagramClient:
         self.cl.set_user_agent()
 
     def randomize_fingerprint(self):
-        """Troca fingerprint (chamar periodicamente ou após suspeita)."""
         self._fingerprint = random.choice(DEVICE_POOL)
         self._apply_fingerprint()
         logger.info(f"[{self.username}] Fingerprint atualizado: {self._fingerprint['device']}")
         return self._fingerprint
 
-    # ─── Login / sessão ──────────────────────────────────────
+    # ─── Login principal ─────────────────────────────────────
 
-    def login(self) -> bool:
-        """Login com sessão salva ou credenciais. Retorna True se ok."""
-        try:
-            if self.session_path.exists():
+    def login(self) -> str:
+        """
+        Tenta login. Retorna:
+          'ok'        — logado com sucesso
+          'challenge' — Instagram pediu verificação por código
+          'error'     — falha definitiva
+        """
+        # 1. Tentar restaurar sessão salva
+        if self.session_path.exists():
+            try:
                 logger.info(f"[{self.username}] Restaurando sessão salva...")
                 self.cl.load_settings(str(self.session_path))
                 self.cl.login(self.username, self.password)
-                self.cl.get_timeline_feed()  # valida sessão
+                self.cl.get_timeline_feed()
                 logger.info(f"[{self.username}] Sessão restaurada com sucesso.")
-                return True
-        except LoginRequired:
-            logger.warning(f"[{self.username}] Sessão expirada. Fazendo login completo...")
-        except Exception as e:
-            logger.warning(f"[{self.username}] Erro ao restaurar sessão: {e}")
+                return "ok"
+            except LoginRequired:
+                logger.warning(f"[{self.username}] Sessão expirada, fazendo login completo...")
+            except ChallengeRequired:
+                return self._handle_challenge()
+            except Exception as e:
+                logger.warning(f"[{self.username}] Erro ao restaurar sessão: {e}")
 
+        # 2. Login completo com credenciais
         return self._full_login()
 
-    def _full_login(self) -> bool:
+    def _full_login(self) -> str:
         try:
             self.cl.login(self.username, self.password)
             self._save_session()
-            logger.info(f"[{self.username}] Login completo realizado.")
-            return True
+            logger.info(f"[{self.username}] Login realizado com sucesso.")
+            return "ok"
+
         except ChallengeRequired:
-            logger.error(f"[{self.username}] Desafio de segurança exigido pelo Instagram.")
-            return False
+            return self._handle_challenge()
+
+        except BadPassword:
+            logger.error(f"[{self.username}] Senha incorreta.")
+            return "error:bad_password"
+
+        except InvalidUserError:
+            logger.error(f"[{self.username}] Usuário não encontrado.")
+            return "error:invalid_user"
+
         except PleaseWaitFewMinutes:
-            logger.error(f"[{self.username}] Instagram pedindo espera. Conta temporariamente bloqueada.")
-            return False
+            logger.error(f"[{self.username}] Instagram pedindo espera. Tente em alguns minutos.")
+            return "error:rate_limit"
+
         except Exception as e:
             logger.error(f"[{self.username}] Falha no login: {e}")
-            return False
+            return f"error:{e}"
+
+    # ─── Challenge (verificação por código) ──────────────────
+
+    def _handle_challenge(self) -> str:
+        """Solicita o envio do código de verificação para email/SMS."""
+        try:
+            logger.info(f"[{self.username}] Challenge detectado. Solicitando código...")
+            # Solicita ao Instagram enviar o código via SMS ou email
+            self.cl.challenge_resolve(self.cl.last_json)
+            self._challenge_pending = True
+            PENDING_CHALLENGES[self.username] = self
+            logger.info(f"[{self.username}] Código solicitado. Aguardando entrada do usuário.")
+            return "challenge"
+        except Exception as e:
+            logger.error(f"[{self.username}] Erro ao resolver challenge: {e}")
+            # Fallback: mesmo sem resolver automaticamente, marca como pendente
+            self._challenge_pending = True
+            PENDING_CHALLENGES[self.username] = self
+            return "challenge"
+
+    def submit_challenge_code(self, code: str) -> bool:
+        """Submete o código de verificação recebido por SMS/email."""
+        try:
+            # Tenta método direto do instagrapi
+            result = self.cl.challenge_resolve(self.cl.last_json, security_code=code)
+            if result:
+                self._challenge_pending = False
+                PENDING_CHALLENGES.pop(self.username, None)
+                self._save_session()
+                logger.info(f"[{self.username}] Challenge resolvido com sucesso!")
+                return True
+        except Exception:
+            pass
+
+        # Fallback: submete manualmente via endpoint de challenge
+        try:
+            challenge_url = self.cl.last_json.get("challenge", {}).get("url", "")
+            if challenge_url:
+                self.cl.private.post(
+                    challenge_url,
+                    data={"security_code": code},
+                )
+                self.cl.login(self.username, self.password)
+                self._challenge_pending = False
+                PENDING_CHALLENGES.pop(self.username, None)
+                self._save_session()
+                logger.info(f"[{self.username}] Challenge resolvido via fallback.")
+                return True
+        except Exception as e:
+            logger.error(f"[{self.username}] Falha ao submeter código: {e}")
+
+        return False
+
+    # ─── Sessão ──────────────────────────────────────────────
 
     def _save_session(self):
         self.cl.dump_settings(str(self.session_path))
-        logger.debug(f"[{self.username}] Sessão salva em {self.session_path}")
+        logger.debug(f"[{self.username}] Sessão salva.")
 
     def save_session(self):
-        """Exposto para chamada externa (ex: após cada ação bem-sucedida)."""
         self._save_session()
 
     def get_session_data(self) -> dict:
-        """Retorna dados da sessão como dict (para backup no Supabase)."""
         if self.session_path.exists():
             with open(self.session_path, "r") as f:
                 return json.load(f)
         return {}
 
     def load_session_from_data(self, data: dict):
-        """Restaura sessão a partir de dict (vindo do Supabase)."""
         settings_path = str(self.session_path)
         with open(settings_path, "w") as f:
             json.dump(data, f)
         self.cl.load_settings(settings_path)
 
-    # ─── Verificação de saúde ────────────────────────────────
+    # ─── Saúde da sessão ─────────────────────────────────────
 
     def is_logged_in(self) -> bool:
         try:
@@ -140,15 +219,12 @@ class InstagramClient:
             return False
 
     def ensure_logged_in(self) -> bool:
-        """Garante sessão ativa antes de qualquer ação."""
         if not self.is_logged_in():
-            logger.warning(f"[{self.username}] Sessão inativa. Tentando reconectar...")
-            return self.login()
+            logger.warning(f"[{self.username}] Sessão inativa. Reconectando...")
+            result = self.login()
+            return result == "ok"
         return True
-
-    # ─── Propriedade do cliente bruto ────────────────────────
 
     @property
     def api(self) -> Client:
-        """Acesso ao client instagrapi bruto para os outros módulos."""
         return self.cl
