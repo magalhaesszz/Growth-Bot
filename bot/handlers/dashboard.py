@@ -500,15 +500,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _show(update, _home_text(ctx), _main_keyboard())
 
 
-@owner_only
 async def on_dashboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
+        return
     await _handle_pending(update, ctx)
 
 
-@owner_only
 async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
+        return
     data = query.data or ""
 
     try:
