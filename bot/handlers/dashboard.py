@@ -455,8 +455,14 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = (update.message.text or "").strip()
     try:
+        # Actions que nao precisam de conta Instagram
+        ACTIONS_SEM_CONTA = {
+            "usuarios_add", "usuarios_remove", "usuarios_add_admin",
+            "video_fundo", "video_process", "video_lote",
+            "video_cfg_width", "video_cfg_pos", "video_cfg_crf",
+        }
         acc = None
-        if not action.startswith("video_"):
+        if action not in ACTIONS_SEM_CONTA and not action.startswith("video_"):
             acc = _selected_account(ctx)
             if not acc:
                 await update.message.reply_text("Nenhuma conta selecionada. Use /start.")
