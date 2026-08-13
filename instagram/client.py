@@ -1,8 +1,7 @@
-import asyncio
 import json
 import logging
-import random
 import time
+import uuid
 from pathlib import Path
 
 from instagrapi import Client
@@ -21,51 +20,7 @@ from config import SESSIONS_DIR
 
 logger = logging.getLogger(__name__)
 
-BLOKS_VERSIONING_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8"
-
-DEVICE_POOL = [
-    {
-        "app_version": "269.0.0.18.75",
-        "android_version": 26,
-        "android_release": "8.0.0",
-        "dpi": "480dpi",
-        "resolution": "1080x1920",
-        "manufacturer": "Samsung",
-        "device": "SM-G955F",
-        "model": "dream2qltesq",
-        "cpu": "samsungexynos8895",
-        "version_code": "314665256",
-        "bloks_versioning_id": BLOKS_VERSIONING_ID,
-    },
-    {
-        "app_version": "269.0.0.18.75",
-        "android_version": 28,
-        "android_release": "9.0.0",
-        "dpi": "420dpi",
-        "resolution": "1080x2220",
-        "manufacturer": "Xiaomi",
-        "device": "Redmi Note 7",
-        "model": "lavender",
-        "cpu": "qcom",
-        "version_code": "314665256",
-        "bloks_versioning_id": BLOKS_VERSIONING_ID,
-    },
-    {
-        "app_version": "269.0.0.18.75",
-        "android_version": 29,
-        "android_release": "10.0",
-        "dpi": "440dpi",
-        "resolution": "1080x2340",
-        "manufacturer": "Motorola",
-        "device": "moto g7 power",
-        "model": "ocean",
-        "cpu": "qcom",
-        "version_code": "314665256",
-        "bloks_versioning_id": BLOKS_VERSIONING_ID,
-    },
-]
-
-# Clientes aguardando código: {username: {"client": InstagramClient, "code": None|str}}
+# Clientes aguardando código: {username: {"client": InstagramClient, "code": None|str, "type": str}}
 PENDING_CHALLENGES: dict[str, dict] = {}
 
 
@@ -74,31 +29,39 @@ class InstagramClient:
         self.username = username
         self.password = password
         self.session_path = Path(SESSIONS_DIR) / f"{username}.json"
-        self._fingerprint = device_fingerprint or random.choice(DEVICE_POOL)
+        # device_fingerprint ignorado — usamos o padrão do instagrapi
+        # que sempre tem a versão correta do app
+        self._fingerprint = {"device": "Pixel 8 Pro (padrão instagrapi)"}
         self.cl = self._build_client()
 
     def _build_client(self) -> Client:
+        """Cria um Client com o dispositivo padrão do instagrapi (versão sempre atualizada)."""
         cl = Client()
-        # Garantir que bloks_versioning_id está presente antes de set_device
-        fp = dict(self._fingerprint)
-        fp.setdefault("bloks_versioning_id", BLOKS_VERSIONING_ID)
-        cl.set_device(fp)
-        cl.set_user_agent()
+        # NÃO chamamos set_device() — o padrão já está correto e atualizado
+        # Apenas randomizamos o device_id para anti-ban
+        cl.set_settings({
+            "device_id": f"android-{uuid.uuid4().hex[:16]}",
+            "uuid": str(uuid.uuid4()),
+            "phone_id": str(uuid.uuid4()),
+            "client_session_id": str(uuid.uuid4()),
+        })
         cl.challenge_code_handler = self._telegram_code_handler
         return cl
 
-    # ─── Fingerprint ─────────────────────────────────────────
-
     def randomize_fingerprint(self):
-        self._fingerprint = random.choice(DEVICE_POOL)
+        """Regenera os UUIDs do dispositivo para anti-ban."""
         self.cl = self._build_client()
-        logger.info(f"[{self.username}] Fingerprint: {self._fingerprint['device']}")
+        logger.info(f"[{self.username}] UUIDs de dispositivo randomizados.")
         return self._fingerprint
 
     # ─── Challenge handler via Telegram ──────────────────────
 
     def _telegram_code_handler(self, username: str, choice=None) -> str:
-        logger.info(f"[{username}] Aguardando código de verificação via Telegram...")
+        """
+        Substitui o input() padrão do instagrapi.
+        Aguarda até 5 minutos pelo código digitado no Telegram.
+        """
+        logger.info(f"[{username}] Aguardando código via Telegram (choice={choice})...")
         PENDING_CHALLENGES[username] = {"client": self, "code": None}
         timeout = 300
         elapsed = 0
@@ -118,6 +81,9 @@ class InstagramClient:
     # ─── Login ───────────────────────────────────────────────
 
     def login(self) -> str:
+        """Retorna: 'ok' | 'challenge' | 'two_factor' | 'error:motivo'"""
+
+        # Tentar restaurar sessão salva
         if self.session_path.exists():
             try:
                 logger.info(f"[{self.username}] Restaurando sessão...")
@@ -153,25 +119,20 @@ class InstagramClient:
             return "two_factor"
 
         except BadPassword as e:
-            last = self.cl.last_json or {}
             err_str = str(e).lower()
+            last    = self.cl.last_json or {}
             last_str = json.dumps(last).lower()
 
-            # "We can send you an email" — Instagram pedindo verificação via email/SMS
-            # Isso ocorre quando IP/dispositivo não é reconhecido
-            # O instagrapi 2.18 tem _try_caa_login para esse caso
-            if "email" in err_str or "send you" in err_str or "get back into" in err_str:
-                logger.warning(f"[{self.username}] Instagram pedindo verificação de email/SMS (CAA login)")
-                return self._handle_caa_challenge()
+            # Instagram pedindo verificação via email/SMS (CAA login)
+            if any(x in err_str for x in ["email", "send you", "get back", "upgrade"]):
+                logger.warning(f"[{self.username}] BadPassword com contexto de verificação: {e}")
+                return self._handle_challenge_flow()
 
-            # Outros contextos de challenge dentro do BadPassword
-            if last.get("two_factor_info") or "two_step" in last_str or "two_factor" in last_str:
-                logger.warning(f"[{self.username}] BadPassword com 2FA context")
+            if last.get("two_factor_info") or "two_factor" in last_str:
                 PENDING_CHALLENGES[self.username] = {"client": self, "code": None, "type": "2fa"}
                 return "two_factor"
 
             if last.get("challenge") or "challenge" in last_str:
-                logger.warning(f"[{self.username}] BadPassword com challenge context")
                 return self._handle_challenge_flow()
 
             logger.error(f"[{self.username}] Senha incorreta: {e}")
@@ -187,35 +148,6 @@ class InstagramClient:
             logger.error(f"[{self.username}] Erro: {type(e).__name__}: {e}")
             return f"error:{type(e).__name__}: {e}"
 
-    def _handle_caa_challenge(self) -> str:
-        """
-        Trata o fluxo CAA (bloks/caa.login) onde o Instagram pede
-        verificação por email/SMS antes de completar o login.
-        Usa challenge_code_handler para pedir o código ao usuário.
-        """
-        try:
-            logger.info(f"[{self.username}] Iniciando CAA challenge flow...")
-            PENDING_CHALLENGES[self.username] = {"client": self, "code": None}
-
-            # Tentar challenge_flow com o last_json atual
-            result = self.cl.challenge_flow(self.cl.last_json)
-            if result:
-                self._save_session()
-                PENDING_CHALLENGES.pop(self.username, None)
-                logger.info(f"[{self.username}] CAA challenge resolvido.")
-                return "ok"
-
-            # Se challenge_flow não funcionar, marcar como challenge pendente
-            # para o usuário digitar o código manualmente
-            logger.warning(f"[{self.username}] challenge_flow retornou False no CAA")
-            return "challenge"
-
-        except Exception as e:
-            logger.error(f"[{self.username}] Erro no CAA challenge: {e}")
-            # Ainda assim marcar como challenge — o código pode chegar
-            PENDING_CHALLENGES[self.username] = {"client": self, "code": None}
-            return "challenge"
-
     def _handle_challenge_flow(self) -> str:
         try:
             logger.info(f"[{self.username}] Iniciando challenge_flow...")
@@ -226,6 +158,7 @@ class InstagramClient:
                 PENDING_CHALLENGES.pop(self.username, None)
                 logger.info(f"[{self.username}] Challenge resolvido.")
                 return "ok"
+            logger.warning(f"[{self.username}] challenge_flow retornou False.")
             return "challenge"
         except Exception as e:
             logger.error(f"[{self.username}] Erro no challenge_flow: {e}")
@@ -241,10 +174,8 @@ class InstagramClient:
 
     def submit_2fa(self, code: str) -> bool:
         try:
-            result = self.cl.login(
-                self.username, self.password,
-                verification_code=str(code).strip()
-            )
+            result = self.cl.login(self.username, self.password,
+                                   verification_code=str(code).strip())
             if result:
                 self._save_session()
                 PENDING_CHALLENGES.pop(self.username, None)
