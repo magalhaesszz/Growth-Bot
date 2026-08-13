@@ -144,26 +144,39 @@ class InstagramClient:
             self._save_session()
             logger.info(f"[{self.username}] Login com sucesso.")
             return "ok"
+
         except ChallengeRequired:
             return self._handle_challenge_flow()
+
         except TwoFactorRequired:
             PENDING_CHALLENGES[self.username] = {"client": self, "code": None, "type": "2fa"}
             return "two_factor"
+
         except BadPassword as e:
-            # No instagrapi 2.18, BadPassword pode ser lançado quando
-            # o Instagram retorna um contexto de 2FA/Bloks verification
-            # Verificar se last_json tem contexto de challenge ou 2FA
             last = self.cl.last_json or {}
-            if last.get("two_factor_info") or last.get("checkpoint_url") or "two_step" in str(last).lower():
-                logger.warning(f"[{self.username}] BadPassword com contexto de 2FA/challenge — solicitando código")
+            err_str = str(e).lower()
+            last_str = json.dumps(last).lower()
+
+            # "We can send you an email" — Instagram pedindo verificação via email/SMS
+            # Isso ocorre quando IP/dispositivo não é reconhecido
+            # O instagrapi 2.18 tem _try_caa_login para esse caso
+            if "email" in err_str or "send you" in err_str or "get back into" in err_str:
+                logger.warning(f"[{self.username}] Instagram pedindo verificação de email/SMS (CAA login)")
+                return self._handle_caa_challenge()
+
+            # Outros contextos de challenge dentro do BadPassword
+            if last.get("two_factor_info") or "two_step" in last_str or "two_factor" in last_str:
+                logger.warning(f"[{self.username}] BadPassword com 2FA context")
                 PENDING_CHALLENGES[self.username] = {"client": self, "code": None, "type": "2fa"}
                 return "two_factor"
-            if last.get("challenge"):
-                logger.warning(f"[{self.username}] BadPassword com challenge — iniciando challenge_flow")
+
+            if last.get("challenge") or "challenge" in last_str:
+                logger.warning(f"[{self.username}] BadPassword com challenge context")
                 return self._handle_challenge_flow()
+
             logger.error(f"[{self.username}] Senha incorreta: {e}")
-            logger.error(f"[{self.username}] last_json: {last}")
             return "error:bad_password"
+
         except (PleaseWaitFewMinutes, RateLimitError):
             return "error:rate_limit"
         except FeedbackRequired:
@@ -171,8 +184,37 @@ class InstagramClient:
         except ReloginAttemptExceeded:
             return "error:relogin_exceeded"
         except Exception as e:
-            logger.error(f"[{self.username}] Erro no login: {e}")
+            logger.error(f"[{self.username}] Erro: {type(e).__name__}: {e}")
             return f"error:{type(e).__name__}: {e}"
+
+    def _handle_caa_challenge(self) -> str:
+        """
+        Trata o fluxo CAA (bloks/caa.login) onde o Instagram pede
+        verificação por email/SMS antes de completar o login.
+        Usa challenge_code_handler para pedir o código ao usuário.
+        """
+        try:
+            logger.info(f"[{self.username}] Iniciando CAA challenge flow...")
+            PENDING_CHALLENGES[self.username] = {"client": self, "code": None}
+
+            # Tentar challenge_flow com o last_json atual
+            result = self.cl.challenge_flow(self.cl.last_json)
+            if result:
+                self._save_session()
+                PENDING_CHALLENGES.pop(self.username, None)
+                logger.info(f"[{self.username}] CAA challenge resolvido.")
+                return "ok"
+
+            # Se challenge_flow não funcionar, marcar como challenge pendente
+            # para o usuário digitar o código manualmente
+            logger.warning(f"[{self.username}] challenge_flow retornou False no CAA")
+            return "challenge"
+
+        except Exception as e:
+            logger.error(f"[{self.username}] Erro no CAA challenge: {e}")
+            # Ainda assim marcar como challenge — o código pode chegar
+            PENDING_CHALLENGES[self.username] = {"client": self, "code": None}
+            return "challenge"
 
     def _handle_challenge_flow(self) -> str:
         try:
