@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS ig_action_logs (
     executed_at     TIMESTAMPTZ DEFAULT now()
 );
 
+-- Usuarios autorizados no bot Telegram
+CREATE TABLE IF NOT EXISTS bot_users (
+    user_id     BIGINT PRIMARY KEY,
+    username    TEXT DEFAULT '?',
+    name        TEXT DEFAULT '?',
+    added_at    TEXT,
+    is_admin    BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+
 -- Fila de ações com retry
 CREATE TABLE IF NOT EXISTS ig_action_queue (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
