@@ -6,6 +6,7 @@ from config import TELEGRAM_TOKEN, TELEGRAM_OWNER_ID
 from bot.handlers.contas import register_contas_handlers
 from bot.handlers.operacoes import register_operacoes_handlers
 from bot.handlers.video import register_video_handlers
+from bot.handlers.dashboard import register_dashboard_handlers
 from scheduler.jobs import setup_scheduler
 
 logging.basicConfig(
@@ -44,8 +45,7 @@ async def post_init(app: Application):
             chat_id=TELEGRAM_OWNER_ID,
             text=(
                 "✅ *Growth Bot online!*\n"
-                "Instagram + Editor de Vídeo carregados.\n"
-                "Use /status para Instagram e /video_status para o editor."
+                "Use /start para abrir o painel de controle."
             ),
             parse_mode="Markdown"
         )
@@ -66,9 +66,14 @@ def main():
         .build()
     )
     app.add_error_handler(on_error)
+
+    # Dashboard primeiro — tem handler de texto genérico (on_dashboard_text)
+    # que deve ficar por último para não capturar mensagens dos outros handlers
     register_contas_handlers(app)
     register_operacoes_handlers(app)
     register_video_handlers(app)
+    register_dashboard_handlers(app)  # /start + botões inline + texto livre
+
     logger.info("Bot rodando.")
     app.run_polling(drop_pending_updates=True)
 
