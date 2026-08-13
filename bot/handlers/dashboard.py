@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 accounts_db = AccountsDB()
 db = DB()
+_video_user_cfg: dict[int, dict] = {}
 
 UNFOLLOW_POLICY_LABELS = {
     "remove_all": "Remover todos",
@@ -146,6 +147,28 @@ def _video_config_keyboard() -> InlineKeyboardMarkup:
         [_button("Fix mirror on/off", "dash:video:cfg:fix_mirror")],
         [_button("Voltar ao editor", "dash:video")],
     ])
+
+
+def _video_home_text() -> str:
+    return (
+        "*Editor de Video*\n\n"
+        "Envie um fundo 1080x1920 e depois escolha entre processar um video "
+        "ou usar o modo lote."
+    )
+
+
+def _video_status_text() -> str:
+    status = vc.api_status()
+    if not status.get("ok"):
+        return f"*Video API indisponivel*\n\n`{status.get('error', 'Erro desconhecido')}`"
+    return (
+        "*Status da Video API*\n\n"
+        f"FFmpeg: *{'online' if status.get('ffmpeg') else 'indisponivel'}*\n"
+        f"Fundos cadastrados: *{status.get('fundos_cadastrados', 0)}*\n"
+        f"Videos na fila: *{status.get('videos_em_fila', 0)}*\n"
+        f"Videos prontos: *{status.get('videos_prontos', 0)}*\n"
+        f"Espaco livre: *{status.get('disco_tmp_livre_mb', 0)} MB*"
+    )
 
 
 def _safe(value, default="-"):
@@ -408,12 +431,14 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = ctx.user_data.pop("dashboard_pending", None)
     if not action:
         return
-    acc = _selected_account(ctx)
-    if not acc:
-        await update.message.reply_text("Nenhuma conta selecionada. Use /start.")
-        return
     text = (update.message.text or "").strip()
     try:
+        acc = None
+        if not action.startswith("video_"):
+            acc = _selected_account(ctx)
+            if not acc:
+                await update.message.reply_text("Nenhuma conta selecionada. Use /start.")
+                return
         if action == "add_target":
             db.add_target(acc["id"], text)
             await update.message.reply_text(f"Alvo adicionado para @{acc['username']}: {text}")
@@ -478,6 +503,57 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Erro ao processar entrada guiada: %s", e, exc_info=True)
         await update.message.reply_text("Nao consegui entender/salvar. Tente novamente pelo /start.")
+
+
+async def on_dashboard_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
+        return
+
+    action = ctx.user_data.get("dashboard_pending")
+    if action not in {"video_fundo", "video_process", "video_lote"}:
+        return
+
+    msg = update.message
+    try:
+        if action == "video_fundo":
+            media = msg.photo[-1] if msg.photo else msg.document
+            filename = getattr(media, "file_name", None) or "fundo.png"
+            file_obj = await media.get_file()
+            content = bytes(await file_obj.download_as_bytearray())
+            result = vc.salvar_fundo(content, filename, str(update.effective_user.id))
+            ctx.user_data.pop("dashboard_pending", None)
+            await msg.reply_text(result.get("message") if result.get("ok") else f"Erro: {result.get('error')}")
+            return
+
+        media = msg.video or msg.document
+        filename = getattr(media, "file_name", None) or "video.mp4"
+        file_obj = await media.get_file()
+        content = bytes(await file_obj.download_as_bytearray())
+
+        if action == "video_lote":
+            lote = ctx.user_data.setdefault("video_lote", [])
+            if len(lote) >= 10:
+                await msg.reply_text("O lote ja atingiu o limite de 10 videos.")
+                return
+            lote.append((content, filename))
+            await msg.reply_text(f"Video adicionado ao lote ({len(lote)}/10).")
+            return
+
+        ctx.user_data.pop("dashboard_pending", None)
+        await msg.reply_text("Processando video...")
+        result = vc.processar_video(
+            content,
+            filename,
+            str(update.effective_user.id),
+            _video_user_cfg.get(update.effective_user.id, {}),
+        )
+        if result.get("ok"):
+            await msg.reply_video(video=result["video_bytes"], filename=result["filename"])
+        else:
+            await msg.reply_text(f"Erro: {result.get('error', 'Falha no processamento')}")
+    except Exception as e:
+        logger.error("Erro ao receber midia do editor: %s", e, exc_info=True)
+        await msg.reply_text(f"Nao foi possivel processar o arquivo: {e}")
 
 
 def _parse_range(text: str) -> tuple[int, int]:
@@ -694,7 +770,7 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _show(update, "Modo seguro aplicado.\n\n" + _config_text(ctx), _config_keyboard())
     except Exception as e:
         logger.error("Erro no painel Telegram: %s", e, exc_info=True)
-        await query.answer("Nao foi possivel executar essa acao.", show_alert=True)
+        await query.message.reply_text("Nao foi possivel executar essa acao. Tente novamente.")
 
 
 async def _handle_config_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str):
@@ -731,3 +807,10 @@ def register_dashboard_handlers(app):
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_dashboard_button, pattern=r"^dash:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_dashboard_text))
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.Document.VIDEO,
+            on_dashboard_media,
+        ),
+        group=1,
+    )
