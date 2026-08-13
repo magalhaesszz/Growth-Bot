@@ -70,9 +70,9 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    elif result == "challenge":
-        # O _telegram_code_handler já está bloqueando em outra thread
-        # aguardando o código — precisamos pedí-lo ao usuário
+    elif result in ("challenge", "ok_challenge"):
+        # Instagram pediu verificação — pode ser challenge normal ou CAA (email/SMS)
+        # O _telegram_code_handler está aguardando o código em outra thread
         ctx.user_data["challenge_ig"] = ig
         await update.message.reply_text(
             f"📱 *Verificação necessária — @{username}*\n\n"
