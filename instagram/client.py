@@ -9,7 +9,7 @@ from instagrapi.exceptions import (
     PleaseWaitFewMinutes,
     ChallengeRequired,
     BadPassword,
-    InvalidUserError,
+    InvalidTargetUser,
     UserNotFound,
 )
 
@@ -124,7 +124,7 @@ class InstagramClient:
             logger.error(f"[{self.username}] Senha incorreta.")
             return "error:bad_password"
 
-        except InvalidUserError:
+        except InvalidTargetUser:
             logger.error(f"[{self.username}] Usuário não encontrado.")
             return "error:invalid_user"
 

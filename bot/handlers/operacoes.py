@@ -268,7 +268,7 @@ async def cmd_unfollow_prazo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_fila_ver(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    from queue.action_queue import ActionQueue
+    from action_queue.action_queue import ActionQueue
     acc = _first_account()
     if not acc:
         return
@@ -284,7 +284,7 @@ async def cmd_fila_ver(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_fila_limpar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    from queue.action_queue import ActionQueue
+    from action_queue.action_queue import ActionQueue
     acc = _first_account()
     if not acc:
         return
