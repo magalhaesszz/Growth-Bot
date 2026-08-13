@@ -53,6 +53,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [_button("Relatorio", "dash:report"), _button("Seguranca", "dash:safety")],
         [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
         [_button("Editor de Video", "dash:video")],
+        [_button("Usuarios", "dash:usuarios")],
         [_button("Atualizar", "dash:home")],
     ])
 
@@ -170,6 +171,16 @@ def _video_status_text() -> str:
         f"Espaco livre: *{status.get('disco_tmp_livre_mb', 0)} MB*"
     )
 
+
+
+def _usuarios_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_button("Ver todos", "dash:usuarios:lista"),
+         _button("Adicionar", "dash:usuarios:add")],
+        [_button("Remover", "dash:usuarios:remove"),
+         _button("Detalhes", "dash:usuarios:detalhes")],
+        [_button("Voltar", "dash:home"), _button("Atualizar", "dash:usuarios")],
+    ])
 
 def _safe(value, default="-"):
     return value if value not in (None, "") else default
@@ -462,6 +473,8 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             start, end = _parse_range(text)
             accounts_db.update_settings(acc["username"], {"hour_start": start, "hour_end": end})
             await update.message.reply_text(f"Horario atualizado: {start}h-{end}h.")
+        elif action in ("usuarios_add", "usuarios_remove"):
+            await _handle_usuarios_pending(update, ctx, action, text)
         elif action == "video_fundo":
             # recebe arquivo via texto (link) — para imagens enviadas como arquivo, o handler de vídeo trata
             await update.message.reply_text("Envie a imagem diretamente como foto ou arquivo no chat.")
@@ -571,8 +584,99 @@ def _parse_pair(text: str, first: str, second: str) -> tuple[int, int]:
     return values[first], values[second]
 
 
-@owner_only
+
+# ─── Gerenciamento de usuarios ───────────────────────────
+
+_ALLOWED_USERS: dict[int, dict] = {}
+
+
+def _usuarios_text() -> str:
+    if not _ALLOWED_USERS:
+        return "*Usuarios autorizados*\n\nNenhum usuario cadastrado ainda."
+    lines = ["*Usuarios autorizados:*\n"]
+    for uid, info in _ALLOWED_USERS.items():
+        name = info.get("username") or info.get("name") or str(uid)
+        lines.append(f"\u2022 @{name} (`{uid}`) \u2014 desde {info.get('added_at','?')} ")
+    return "\n".join(lines)
+
+
+async def _handle_usuarios(update, ctx, data: str):
+    if data in ("dash:usuarios", "dash:usuarios:lista"):
+        await _show(update, _usuarios_text(), _usuarios_keyboard())
+    elif data == "dash:usuarios:add":
+        _prompt(ctx, "usuarios_add")
+        await _show(update,
+            "*Adicionar usuario*\n\nEnvie o ID numerico do Telegram do usuario:",
+            InlineKeyboardMarkup([[_button("Cancelar", "dash:usuarios")]]))
+    elif data == "dash:usuarios:remove":
+        if not _ALLOWED_USERS:
+            await _show(update, "Nenhum usuario para remover.", _usuarios_keyboard())
+            return
+        _prompt(ctx, "usuarios_remove")
+        lista = "\n".join(
+            f"\u2022 @{v.get('username','?')} \u2014 ID: `{k}`"
+            for k, v in _ALLOWED_USERS.items()
+        )
+        await _show(update,
+            f"*Remover usuario*\n\n{lista}\n\nEnvie o ID numerico:",
+            InlineKeyboardMarkup([[_button("Cancelar", "dash:usuarios")]]))
+    elif data == "dash:usuarios:detalhes":
+        if not _ALLOWED_USERS:
+            await _show(update, "Nenhum usuario.", _usuarios_keyboard())
+            return
+        lines = ["*Detalhes:*\n"]
+        for uid, info in _ALLOWED_USERS.items():
+            lines.append(
+                f"\U0001f464 @{info.get('username','?')}\n"
+                f"   ID: `{uid}`\n"
+                f"   Desde: {info.get('added_at','?')}\n"
+            )
+        await _show(update, "\n".join(lines), _usuarios_keyboard())
+
+
+async def _handle_usuarios_pending(update, ctx, action: str, text: str):
+    from datetime import datetime
+    msg = update.message
+    text = text.lstrip("@").strip()
+    if action == "usuarios_add":
+        if text.isdigit():
+            uid = int(text)
+            _ALLOWED_USERS[uid] = {
+                "name": "?", "username": text,
+                "added_at": datetime.now().strftime("%d/%m/%Y")
+            }
+            await msg.reply_text(f"\u2705 Usuario `{uid}` autorizado.", parse_mode="Markdown")
+        else:
+            await msg.reply_text(
+                "\u26a0\ufe0f Envie o *ID numerico* do usuario.\n"
+                "Para descobrir, peca ao usuario enviar /start no bot.",
+                parse_mode="Markdown")
+    elif action == "usuarios_remove":
+        if text.isdigit() and int(text) in _ALLOWED_USERS:
+            info = _ALLOWED_USERS.pop(int(text))
+            await msg.reply_text(
+                f"\U0001f5d1 Usuario @{info.get('username','?')} removido.",
+                parse_mode="Markdown")
+        else:
+            await msg.reply_text("ID nao encontrado.")
+    ctx.user_data.pop("dashboard_pending", None)
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if user.id != TELEGRAM_OWNER_ID:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f4e9 Falar com o admin", url="https://t.me/thsistem7")
+        ]])
+        await update.message.reply_text(
+            "\U0001f512 *Acesso Privado*\n\n"
+            "Este bot \xe9 de uso exclusivo e n\xe3o est\xe1 dispon\xedvel publicamente.\n\n"
+            "Caso tenha interesse em uma ferramenta similar, entre em contato com o administrador.",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        return
     await _show(update, _home_text(ctx), _main_keyboard())
 
 
@@ -758,6 +862,8 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pkey, pmsg = prompts_video[action]
                 _prompt(ctx, pkey)
                 await _show(update, pmsg, InlineKeyboardMarkup([[_button("Cancelar", "dash:video:config")]]))
+        elif data.startswith("dash:usuarios"):
+            await _handle_usuarios(update, ctx, data)
         elif data == "dash:safe_mode":
             acc = _selected_account(ctx)
             if acc:
