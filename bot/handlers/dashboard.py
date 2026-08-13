@@ -746,23 +746,33 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
-    # Verificar se e admin ou usuario autorizado
-    _load_usuarios()
-    is_authorized = (user.id == TELEGRAM_OWNER_ID) or user.id in _ALLOWED_USERS
-    if not is_authorized:
-        logger.info(f"Acesso negado — user_id: {user.id}, username: @{user.username}")
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("\U0001f4e9 Falar com o admin", url="https://t.me/thsistem7")
-        ]])
-        await update.message.reply_text(
-            "\U0001f512 *Acesso Privado*\n\n"
-            "Este bot e de uso exclusivo e nao esta disponivel publicamente.\n\n"
-            "Caso tenha interesse em uma ferramenta similar, entre em contato com o administrador.",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
+
+    # 1. Owner sempre tem acesso — sem depender do banco
+    if user.id == TELEGRAM_OWNER_ID:
+        await _show(update, _home_text(ctx), _main_keyboard())
         return
-    await _show(update, _home_text(ctx), _main_keyboard())
+
+    # 2. Verificar se e usuario autorizado no banco (opcional)
+    try:
+        _load_usuarios()
+        if user.id in _ALLOWED_USERS:
+            await _show(update, _home_text(ctx), _main_keyboard())
+            return
+    except Exception:
+        pass
+
+    # 3. Nao autorizado — mostrar tela privada
+    logger.info(f"Acesso negado — user_id: {user.id}, username: @{user.username}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\U0001f4e9 Falar com o admin", url="https://t.me/thsistem7")
+    ]])
+    await update.message.reply_text(
+        "\U0001f512 *Acesso Privado*\n\n"
+        "Este bot e de uso exclusivo e nao esta disponivel publicamente.\n\n"
+        "Caso tenha interesse em uma ferramenta similar, entre em contato com o administrador.",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
 
 
 async def on_dashboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
