@@ -10,6 +10,7 @@ from database.operations import DB
 from instagram.risk_detector import RiskDetector
 risk_detector = RiskDetector()
 from action_queue.action_queue import ActionQueue
+import video_client as vc
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [_button("Fila", "dash:queue"), _button("Logs", "dash:logs")],
         [_button("Relatorio", "dash:report"), _button("Seguranca", "dash:safety")],
         [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
+        [_button("Editor de Video", "dash:video")],
         [_button("Atualizar", "dash:home")],
     ])
 
@@ -121,6 +123,28 @@ def _queue_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_button("Limpar fila", "dash:queue_clear")],
         [_button("Voltar", "dash:home"), _button("Atualizar", "dash:queue")],
+    ])
+
+
+
+def _video_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_button("Status da API", "dash:video:status")],
+        [_button("Enviar fundo", "dash:video:set_fundo"), _button("Ver fundo", "dash:video:get_fundo")],
+        [_button("Processar video", "dash:video:process"), _button("Modo lote", "dash:video:lote")],
+        [_button("Configuracoes", "dash:video:config"), _button("Reset config", "dash:video:config_reset")],
+        [_button("Limpar temp", "dash:video:limpar")],
+        [_button("Voltar", "dash:home"), _button("Atualizar", "dash:video")],
+    ])
+
+def _video_config_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_button("Largura do video", "dash:video:cfg:video_width")],
+        [_button("Posicao vertical", "dash:video:cfg:position_y")],
+        [_button("Qualidade (CRF)", "dash:video:cfg:output_crf")],
+        [_button("Anti-ban on/off", "dash:video:cfg:antiban")],
+        [_button("Fix mirror on/off", "dash:video:cfg:fix_mirror")],
+        [_button("Voltar ao editor", "dash:video")],
     ])
 
 
@@ -413,6 +437,32 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             start, end = _parse_range(text)
             accounts_db.update_settings(acc["username"], {"hour_start": start, "hour_end": end})
             await update.message.reply_text(f"Horario atualizado: {start}h-{end}h.")
+        elif action == "video_fundo":
+            # recebe arquivo via texto (link) — para imagens enviadas como arquivo, o handler de vídeo trata
+            await update.message.reply_text("Envie a imagem diretamente como foto ou arquivo no chat.")
+        elif action == "video_process":
+            await update.message.reply_text("Envie o .mp4 diretamente no chat para processar.")
+        elif action == "video_lote":
+            # coleta videos
+            await update.message.reply_text("Envie os .mp4 um a um. Quando terminar, clique em 'Processar lote agora'.")
+        elif action == "video_cfg_width":
+            try:
+                _video_user_cfg.setdefault(update.effective_user.id, {})["video_width"] = int(text)
+                await update.message.reply_text(f"Largura atualizada: {text}px.")
+            except ValueError:
+                await update.message.reply_text("Envie um numero inteiro (ex: 800).")
+        elif action == "video_cfg_pos":
+            try:
+                _video_user_cfg.setdefault(update.effective_user.id, {})["position_y"] = float(text)
+                await update.message.reply_text(f"Posicao atualizada: {text}.")
+            except ValueError:
+                await update.message.reply_text("Envie um numero decimal (ex: 0.25).")
+        elif action == "video_cfg_crf":
+            try:
+                _video_user_cfg.setdefault(update.effective_user.id, {})["output_crf"] = int(text)
+                await update.message.reply_text(f"CRF atualizado: {text}.")
+            except ValueError:
+                await update.message.reply_text("Envie um numero inteiro (ex: 18).")
         elif action == "delay":
             delay_min, delay_max = _parse_range(text)
             accounts_db.update_settings(acc["username"], {"delay_min": delay_min, "delay_max": delay_max})
@@ -544,6 +594,92 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             policy = data.rsplit(":", 1)[1]
             accounts_db.update_settings(acc["username"], {"unfollow_policy": policy})
             await _show(update, "Regra de unfollow atualizada.\n\n" + _config_text(ctx), _config_keyboard())
+        elif data == "dash:video":
+            await _show(update, _video_home_text(), _video_keyboard())
+        elif data == "dash:video:status":
+            await _show(update, _video_status_text(), _video_keyboard())
+        elif data == "dash:video:get_fundo":
+            fundo = vc.ver_fundo(str(update.effective_user.id))
+            if fundo:
+                if update.callback_query:
+                    await update.callback_query.message.reply_photo(
+                        photo=fundo, caption="Fundo atual cadastrado."
+                    )
+                await _show(update, _video_home_text(), _video_keyboard())
+            else:
+                await _show(update, "*Nenhum fundo cadastrado.*\nUse o botao 'Enviar fundo'.", _video_keyboard())
+        elif data == "dash:video:set_fundo":
+            _prompt(ctx, "video_fundo")
+            await _show(update, "Envie a imagem de fundo (PNG/JPG, 1080x1920px).", InlineKeyboardMarkup([[_button("Cancelar", "dash:video")]]))
+        elif data == "dash:video:process":
+            _prompt(ctx, "video_process")
+            await _show(update, "Envie o video .mp4 para processar.", InlineKeyboardMarkup([[_button("Cancelar", "dash:video")]]))
+        elif data == "dash:video:lote":
+            ctx.user_data["video_lote"] = []
+            _prompt(ctx, "video_lote")
+            await _show(update, "Modo lote: envie os .mp4 um a um (max 10) e depois clique em processar.", InlineKeyboardMarkup([
+                [_button("Processar lote agora", "dash:video:lote_run")],
+                [_button("Cancelar", "dash:video")],
+            ]))
+        elif data == "dash:video:lote_run":
+            lote = ctx.user_data.pop("video_lote", [])
+            ctx.user_data.pop("dashboard_pending", None)
+            if not lote:
+                await _show(update, "Nenhum video na fila.", _video_keyboard())
+                return
+            if update.callback_query:
+                await update.callback_query.message.reply_text(f"⏳ Processando {len(lote)} video(s)...")
+            result = vc.processar_lote(lote, str(update.effective_user.id), _video_user_cfg.get(update.effective_user.id, {}))
+            for item in (result.get("resultados") or []):
+                if item.get("ok"):
+                    vbytes = vc.download_lote_video(item["job_id"])
+                    if vbytes and update.callback_query:
+                        await update.callback_query.message.reply_video(
+                            video=vbytes,
+                            filename=f"editado_{item['arquivo']}",
+                            caption=f"✅ {item['arquivo']} — {item.get('size_mb','?')} MB"
+                        )
+                elif update.callback_query:
+                    await update.callback_query.message.reply_text(f"❌ {item['arquivo']}: {item.get('error','erro')}")
+            await _show(update, _video_home_text(), _video_keyboard())
+        elif data == "dash:video:config":
+            uid = update.effective_user.id
+            cfg = _video_user_cfg.get(uid, {})
+            cfg_text = (
+                "*Configuracoes do editor*\n\n"
+                f"Largura do video: *{cfg.get('video_width', 800)}px*\n"
+                f"Posicao vertical: *{cfg.get('position_y', 0.25)}*\n"
+                f"Qualidade CRF: *{cfg.get('output_crf', 18)}*\n"
+                f"Anti-ban: *{'ativo' if cfg.get('antiban', True) else 'desativado'}*\n"
+                f"Fix mirror: *{'sim' if cfg.get('fix_mirror', False) else 'nao'}*"
+            )
+            await _show(update, cfg_text, _video_config_keyboard())
+        elif data == "dash:video:config_reset":
+            _video_user_cfg.pop(update.effective_user.id, None)
+            await _show(update, "Configuracoes resetadas para o padrao.", _video_keyboard())
+        elif data == "dash:video:limpar":
+            result = vc.limpar_tmp()
+            msg = f"🗑 {result.get('removidos', 0)} arquivo(s) removido(s)." if result.get("ok") else f"Erro: {result.get('error')}"
+            await _show(update, msg, _video_keyboard())
+        elif data.startswith("dash:video:cfg:"):
+            action = data.rsplit(":", 1)[1]
+            prompts_video = {
+                "video_width": ("video_cfg_width", "Envie a largura em pixels (ex: 800)."),
+                "position_y":  ("video_cfg_pos",   "Envie a posicao vertical (0.0=topo, 1.0=base, ex: 0.25)."),
+                "output_crf":  ("video_cfg_crf",   "Envie o CRF (18=alta qualidade, 28=comprimido)."),
+                "antiban":     None,
+                "fix_mirror":  None,
+            }
+            if action in ("antiban", "fix_mirror"):
+                uid = update.effective_user.id
+                cfg = _video_user_cfg.setdefault(uid, {})
+                cfg[action] = not cfg.get(action, action != "antiban")
+                val = "ativo" if cfg[action] else "desativado"
+                await _show(update, f"*{action}* atualizado: *{val}*", _video_config_keyboard())
+            elif action in prompts_video:
+                pkey, pmsg = prompts_video[action]
+                _prompt(ctx, pkey)
+                await _show(update, pmsg, InlineKeyboardMarkup([[_button("Cancelar", "dash:video:config")]]))
         elif data == "dash:safe_mode":
             acc = _selected_account(ctx)
             if acc:
