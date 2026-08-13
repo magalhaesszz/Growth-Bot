@@ -149,7 +149,20 @@ class InstagramClient:
         except TwoFactorRequired:
             PENDING_CHALLENGES[self.username] = {"client": self, "code": None, "type": "2fa"}
             return "two_factor"
-        except BadPassword:
+        except BadPassword as e:
+            # No instagrapi 2.18, BadPassword pode ser lançado quando
+            # o Instagram retorna um contexto de 2FA/Bloks verification
+            # Verificar se last_json tem contexto de challenge ou 2FA
+            last = self.cl.last_json or {}
+            if last.get("two_factor_info") or last.get("checkpoint_url") or "two_step" in str(last).lower():
+                logger.warning(f"[{self.username}] BadPassword com contexto de 2FA/challenge — solicitando código")
+                PENDING_CHALLENGES[self.username] = {"client": self, "code": None, "type": "2fa"}
+                return "two_factor"
+            if last.get("challenge"):
+                logger.warning(f"[{self.username}] BadPassword com challenge — iniciando challenge_flow")
+                return self._handle_challenge_flow()
+            logger.error(f"[{self.username}] Senha incorreta: {e}")
+            logger.error(f"[{self.username}] last_json: {last}")
             return "error:bad_password"
         except (PleaseWaitFewMinutes, RateLimitError):
             return "error:rate_limit"
