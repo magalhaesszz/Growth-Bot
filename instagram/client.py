@@ -233,6 +233,12 @@ class InstagramClient:
 
         except (PleaseWaitFewMinutes, RateLimitError):
             return "error:rate_limit"
+        except Exception as e:
+            err_str = str(e).lower()
+            # 429 Too Many Requests — rate limit por IP
+            if "429" in err_str or "too many" in err_str or "retry" in err_str.lower():
+                logger.error(f"[{self.username}] Rate limit 429 — aguarde 30-60 minutos antes de tentar novamente.")
+                return "error:rate_limit_429"
         except FeedbackRequired:
             return "error:feedback_required"
         except ReloginAttemptExceeded:
