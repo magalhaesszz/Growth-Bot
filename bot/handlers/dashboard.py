@@ -604,19 +604,21 @@ _ALLOWED_USERS: dict[int, dict] = {}
 
 
 def _load_usuarios():
-    """Carrega usuarios do Supabase para memoria."""
+    """Carrega usuarios do Supabase para memoria. user_id sempre int."""
     try:
         from database.operations import DB
         db = DB()
         rows = db.sb.table("bot_users").select("*").execute().data or []
         _ALLOWED_USERS.clear()
         for r in rows:
-            _ALLOWED_USERS[r["user_id"]] = {
+            uid = int(r["user_id"])  # garantir int, nao str
+            _ALLOWED_USERS[uid] = {
                 "username": r.get("username", "?"),
                 "name": r.get("name", "?"),
                 "added_at": r.get("added_at", "?"),
                 "is_admin": r.get("is_admin", False),
             }
+        logger.info(f"Usuarios carregados: {len(_ALLOWED_USERS)}")
     except Exception as e:
         logger.warning(f"Nao foi possivel carregar usuarios: {e}")
 
@@ -626,7 +628,10 @@ def _save_usuario(user_id: int, data: dict):
     try:
         from database.operations import DB
         db = DB()
-        db.sb.table("bot_users").upsert({"user_id": user_id, **data}).execute()
+        payload = {"user_id": int(user_id)}
+        payload.update({k: v for k, v in data.items() if k != "user_id"})
+        db.sb.table("bot_users").upsert(payload).execute()
+        logger.info(f"Usuario {user_id} salvo no Supabase.")
     except Exception as e:
         logger.warning(f"Nao foi possivel salvar usuario: {e}")
 
@@ -709,16 +714,25 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
             return
         uid = int(text)
         is_admin = ctx.user_data.pop("usuarios_is_admin", False)
+        # Tentar buscar username real do Telegram
+        try:
+            chat = await msg.get_bot().get_chat(uid)
+            username_real = chat.username or str(uid)
+            name_real = chat.full_name or "?"
+        except Exception:
+            username_real = str(uid)
+            name_real = "?"
         data = {
-            "username": str(uid), "name": "?",
+            "username": username_real,
+            "name": name_real,
             "added_at": datetime.now().strftime("%d/%m/%Y"),
             "is_admin": is_admin,
         }
         _ALLOWED_USERS[uid] = data
         _save_usuario(uid, data)
-        tipo = "Admin" if is_admin else "Usuario"
+        tipo = "Admin \U0001f451" if is_admin else "Usuario"
         await msg.reply_text(
-            f"\u2705 {tipo} `{uid}` autorizado com sucesso!",
+            f"\u2705 {tipo} @{username_real} (`{uid}`) autorizado!",
             parse_mode="Markdown")
     elif action == "usuarios_add_admin":
         ctx.user_data["usuarios_is_admin"] = True
@@ -762,7 +776,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
     # 3. Nao autorizado — mostrar tela privada
-    logger.info(f"Acesso negado — user_id: {user.id}, username: @{user.username}")
+    logger.info(
+        f"ACESSO NEGADO | user_id={user.id} | "
+        f"username=@{user.username} | name={user.full_name}"
+    )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("\U0001f4e9 Falar com o admin", url="https://t.me/thsistem7")
     ]])
