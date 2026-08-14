@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime
 from telegram import Update
@@ -6,14 +5,14 @@ from telegram.ext import ContextTypes, CommandHandler
 
 from database.accounts import AccountsDB
 from database.operations import DB
-from instagram.risk_detector import get_risk_detector
+from instagram.risk_detector import RiskDetector
 from reports.daily import ReportGenerator
 from config import TELEGRAM_OWNER_ID
 
 logger = logging.getLogger(__name__)
 accounts_db = AccountsDB()
 db = DB()
-risk_detector = get_risk_detector()
+risk_detector = RiskDetector()
 reporter = ReportGenerator()
 
 
@@ -52,11 +51,8 @@ async def cmd_alvo_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from instagram.client import InstagramClient
     from instagram.scraper import Scraper
     ig = InstagramClient(acc["username"], acc["password"])
-    result_login = await asyncio.to_thread(ig.login)
-    if result_login != "ok":
-        await update.message.reply_text("Não foi possível conectar a conta selecionada.")
-        return
-    page = await asyncio.to_thread(Scraper(ig).resolve_page, url)
+    result_login = ig.login()
+    page = Scraper(ig).resolve_page(url)
     if not page:
         await update.message.reply_text("❌ Página não encontrada no Instagram.")
         return
