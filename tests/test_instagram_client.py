@@ -97,6 +97,12 @@ class FakeClient:
             return verification_code == "123456"
         return self.standard_login_result
 
+    def login_by_sessionid(self, sessionid):
+        if sessionid.endswith("invalid"):
+            return False
+        self.username = "conta"
+        return True
+
     def get_timeline_feed(self):
         return {}
 
@@ -158,6 +164,20 @@ class InstagramClientTests(unittest.TestCase):
         FakeClient.login_result = "incorrect password"
         ig = client_module.InstagramClient("conta", "senha")
         self.assertEqual(ig.login(), "error:credentials_rejected")
+
+    def test_existing_authenticated_session_can_be_imported(self):
+        ig = client_module.InstagramClient("conta", "")
+        sessionid = "1234567890:" + ("a" * 40)
+        self.assertEqual(ig.login_with_sessionid(sessionid), "ok")
+        self.assertTrue(ig.session_path.exists())
+
+    def test_session_from_another_account_is_rejected(self):
+        ig = client_module.InstagramClient("outra", "")
+        sessionid = "1234567890:" + ("a" * 40)
+        self.assertEqual(
+            ig.login_with_sessionid(sessionid),
+            "error:session_account_mismatch",
+        )
 
     def test_invalid_code_is_rejected(self):
         FakeClient.login_result = "challenge"

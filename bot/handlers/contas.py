@@ -438,6 +438,56 @@ def _salvar_conta(ig: InstagramClient, username: str, password: str):
 # ─── Demais comandos ─────────────────────────────────────────
 
 @owner_only
+async def cmd_conta_sessao(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) != 2:
+        await update.message.reply_text(
+            "Uso: `/conta_sessao @usuario SESSIONID`", parse_mode="Markdown"
+        )
+        return
+
+    username = ctx.args[0].strip().lstrip("@")
+    sessionid = ctx.args[1].strip()
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        await update.message.reply_text("❌ Nome de usuário do Instagram inválido.")
+        return
+
+    # O comando contém uma credencial equivalente à senha.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await ctx.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"🔄 Validando sessão de *@{username}*...",
+        parse_mode="Markdown",
+    )
+    import asyncio
+    ig = InstagramClient(username, "")
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, ig.login_with_sessionid, sessionid
+    )
+    if result == "ok":
+        _salvar_conta(ig, username, "")
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Sessão de *@{username}* conectada e salva!",
+            parse_mode="Markdown",
+        )
+        return
+
+    messages = {
+        "error:invalid_sessionid": "SESSIONID inválido ou incompleto.",
+        "error:session_expired": "A sessão já expirou. Gere uma nova.",
+        "error:session_account_mismatch": "A sessão pertence a outra conta.",
+        "error:session_rejected": "O Instagram recusou essa sessão.",
+    }
+    await ctx.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"❌ {messages.get(result, 'Não foi possível importar a sessão.')}",
+    )
+
+@owner_only
 async def cmd_conta_lista(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accounts = accounts_db.list_accounts()
     if not accounts:
@@ -550,6 +600,7 @@ def register_contas_handlers(app):
         per_message=False,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("conta_sessao",     cmd_conta_sessao))
     app.add_handler(CommandHandler("conta_lista",       cmd_conta_lista))
     app.add_handler(CommandHandler("conta_pausar",      cmd_conta_pausar))
     app.add_handler(CommandHandler("conta_retomar",     cmd_conta_retomar))

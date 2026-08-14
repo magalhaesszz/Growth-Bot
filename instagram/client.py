@@ -251,6 +251,33 @@ class InstagramClient:
             )
             return f"error:{type(exc).__name__}"
 
+    def login_with_sessionid(self, sessionid: str) -> str:
+        """Importa uma sessão já autenticada no app/site oficial."""
+        clean = str(sessionid).strip()
+        if len(clean) <= 30 or not re.match(r"^\d+", clean):
+            return "error:invalid_sessionid"
+        try:
+            if not self.cl.login_by_sessionid(clean):
+                return "error:session_rejected"
+            authenticated_username = str(getattr(self.cl, "username", "")).lstrip("@")
+            if authenticated_username.casefold() != self.username.casefold():
+                logger.warning(
+                    "[%s] Sessionid pertence a outra conta.", self.username
+                )
+                return "error:session_account_mismatch"
+            self._save_session()
+            self._reset_pending()
+            return "ok"
+        except LoginRequired:
+            return "error:session_expired"
+        except Exception as exc:
+            logger.warning(
+                "[%s] Importacao de sessao rejeitada: %s",
+                self.username,
+                type(exc).__name__,
+            )
+            return "error:session_rejected"
+
     def _prepare_caa_challenge(self, send_result: dict) -> bool:
         entry_context = self.cl.bloks_extract_context_data(
             send_result, AP_2SV_ENTRYPOINT
