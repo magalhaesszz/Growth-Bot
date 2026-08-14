@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from config import SUPABASE_URL, SUPABASE_KEY
 
@@ -23,7 +23,7 @@ class DB:
         }).execute()
 
     def get_unfollow_candidates(self, account_id, after_days: int) -> list[dict]:
-        cutoff = (datetime.utcnow() - timedelta(days=after_days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
         res = (
             self.sb.table("ig_followed")
             .select("*")
@@ -37,7 +37,7 @@ class DB:
     def mark_unfollowed(self, account_id, target_username):
         self.sb.table("ig_followed").update({
             "status": "unfollowed",
-            "unfollowed_at": datetime.utcnow().isoformat(),
+            "unfollowed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("account_id", account_id).eq("target_username", target_username).execute()
 
     def mark_follows_back(self, account_id, target_username):
@@ -55,12 +55,25 @@ class DB:
         return {r["target_user_id"] for r in (res.data or [])}
 
     def count_today_follows(self, account_id) -> int:
-        today = datetime.utcnow().date().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
         res = (
             self.sb.table("ig_followed")
             .select("id", count="exact")
             .eq("account_id", account_id)
             .gte("followed_at", today)
+            .execute()
+        )
+        return res.count or 0
+
+    def count_today_unfollows(self, account_id) -> int:
+        today = datetime.now(timezone.utc).date().isoformat()
+        res = (
+            self.sb.table("ig_action_logs")
+            .select("id", count="exact")
+            .eq("account_id", account_id)
+            .eq("action", "unfollow")
+            .eq("success", True)
+            .gte("executed_at", today)
             .execute()
         )
         return res.count or 0
@@ -190,7 +203,7 @@ class DB:
         return res.data or []
 
     def get_stats_today(self, account_id) -> dict:
-        today = datetime.utcnow().date().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
         logs = (
             self.sb.table("ig_action_logs")
             .select("action, success")

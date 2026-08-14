@@ -2,7 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application
 
-from config import TELEGRAM_TOKEN, TELEGRAM_OWNER_ID
+from config import TELEGRAM_TOKEN, TELEGRAM_OWNER_ID, validate_config
 from bot.handlers.contas import register_contas_handlers
 from bot.handlers.operacoes import register_operacoes_handlers
 from bot.handlers.video import register_video_handlers
@@ -47,6 +47,7 @@ async def on_error(update: object, context):
 
 
 def main():
+    validate_config()
     logger.info("Iniciando Growth Bot...")
     app = (
         Application.builder()

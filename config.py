@@ -1,4 +1,5 @@
 import os
+import tempfile
 from dotenv import load_dotenv
 
 # load_dotenv funciona localmente; no Discloud as vars já estão no ambiente
@@ -14,6 +15,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ─── Criptografia de sessões ─────────────────────────────────
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
+
+# ─── Video API ───────────────────────────────────────────────
+VIDEO_API_URL = os.getenv("VIDEO_API_URL", "").rstrip("/")
+VIDEO_API_SECRET = os.getenv("VIDEO_API_SECRET", "")
 
 # ─── Limites padrão ──────────────────────────────────────────
 DEFAULT_DAILY_FOLLOWS = 40
@@ -41,10 +46,50 @@ QUEUE_BACKOFF_BASE = 60            # segundos base para backoff exponencial
 
 # ─── Proxy Instagram (opcional — usar se IP do servidor for bloqueado) ──
 # Formato: http://usuario:senha@host:porta  ou  socks5://host:porta
-INSTAGRAM_PROXY = os.getenv('INSTAGRAM_PROXY', '')  # vazio = sem proxy
+INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "").strip()  # vazio = conexão direta
+INSTAGRAM_USE_PROXY = os.getenv("INSTAGRAM_USE_PROXY", "false").strip().lower() == "true"
+INSTAGRAM_COUNTRY = os.getenv("INSTAGRAM_COUNTRY", "BR")
+INSTAGRAM_COUNTRY_CODE = int(os.getenv("INSTAGRAM_COUNTRY_CODE", "55"))
+INSTAGRAM_LOCALE = os.getenv("INSTAGRAM_LOCALE", "pt_BR")
+INSTAGRAM_TIMEZONE_OFFSET = int(os.getenv("INSTAGRAM_TIMEZONE_OFFSET", "-10800"))
 
 # ─── Pasta de sessões ────────────────────────────────────────
 # /tmp é gravável tanto no Discloud quanto localmente.
 # Backup criptografado das sessões fica no Supabase (persistente).
-SESSIONS_DIR = os.path.join("/tmp", "growth-bot-sessions")
+SESSIONS_DIR = os.getenv("SESSIONS_DIR", "").strip() or os.path.join(
+    tempfile.gettempdir(), "growth-bot-sessions"
+)
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+
+def validate_config() -> None:
+    required = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_OWNER_ID": TELEGRAM_OWNER_ID,
+        "SUPABASE_URL": SUPABASE_URL,
+        "SUPABASE_KEY": SUPABASE_KEY,
+        "SESSION_ENCRYPTION_KEY": SESSION_ENCRYPTION_KEY,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError("Variáveis obrigatórias ausentes: " + ", ".join(missing))
+    if TELEGRAM_OWNER_ID <= 0:
+        raise RuntimeError("TELEGRAM_OWNER_ID deve ser um número positivo")
+    if str(TELEGRAM_TOKEN).count(":") != 1:
+        raise RuntimeError("TELEGRAM_TOKEN possui formato inválido")
+    if not str(SUPABASE_URL).startswith("https://"):
+        raise RuntimeError("SUPABASE_URL deve usar HTTPS")
+
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet(str(SESSION_ENCRYPTION_KEY).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("SESSION_ENCRYPTION_KEY não é uma chave Fernet válida") from exc
+
+    if bool(VIDEO_API_URL) != bool(VIDEO_API_SECRET):
+        raise RuntimeError("VIDEO_API_URL e VIDEO_API_SECRET devem ser configurados juntos")
+    if VIDEO_API_URL and not VIDEO_API_URL.startswith("https://"):
+        raise RuntimeError("VIDEO_API_URL deve usar HTTPS")
+    if INSTAGRAM_USE_PROXY and not INSTAGRAM_PROXY:
+        raise RuntimeError("INSTAGRAM_USE_PROXY=true exige INSTAGRAM_PROXY configurada")

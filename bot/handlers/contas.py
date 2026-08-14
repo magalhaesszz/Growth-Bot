@@ -49,11 +49,20 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     username = ctx.args[0].lstrip("@")
     password = ctx.args[1]
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        await update.message.reply_text("❌ Nome de usuário do Instagram inválido.")
+        return ConversationHandler.END
     ctx.user_data["challenge_username"] = username
     ctx.user_data["challenge_password"] = password
 
     await update.message.reply_text(
         f"🔄 Conectando *@{username}*...", parse_mode="Markdown")
+
+    # O comando contém a senha; removê-lo do chat assim que possível.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
     import asyncio
     ig = InstagramClient(username, password)
@@ -70,7 +79,16 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif result == "challenge":
         ctx.user_data["challenge_ig"] = ig
-        return await _mostrar_selecao_metodo(update, username)
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"📨 *Verificação necessária — @{username}*\n\n"
+                "O Instagram enviou um código. Digite os 6 dígitos recebidos "
+                "ou um código de backup de 8 dígitos."
+            ),
+            parse_mode="Markdown",
+        )
+        return AGUARDANDO_CODIGO
 
     elif result == "two_factor":
         ctx.user_data["challenge_ig"] = ig
@@ -92,6 +110,18 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ *Senha incorreta* para @{username}.",
             parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif result == "error:proxy":
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"❌ *Falha na proxy de @{username}.*\n\n"
+                "Remova `INSTAGRAM_PROXY` para usar conexão direta ou corrija "
+                "as credenciais da proxy."
+            ),
+            parse_mode="Markdown",
+        )
         return ConversationHandler.END
 
     elif result == "error:feedback_required":
@@ -193,6 +223,12 @@ async def receber_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import re as _re
     clean = _re.sub(r"[\s\-]+", "", code_raw)
 
+    # O texto recebido contem um codigo de seguranca; remova-o do chat.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     if not clean.isdigit():
         await update.message.reply_text(
             "❌ Código inválido — digite apenas números (com ou sem hífen).")
@@ -202,17 +238,18 @@ async def receber_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     preview = format_preview(clean)
 
     # Validar tamanho
+    if verify_type == "backup" and len(clean) != 8:
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Código de backup deve ter 8 dígitos. Digite novamente.",
+        )
+        return AGUARDANDO_CODIGO
     if len(clean) == 6:
         tipo_label = "SMS / Email"
         emoji = "📨"
     elif len(clean) == 8:
         tipo_label = "Código de backup"
         emoji = "🔑"
-    elif len(clean) == 6 and verify_type == "backup":
-        await update.message.reply_text(
-            "❌ Backup code tem 8 dígitos. Você digitou 6.\n"
-            "Digite os 8 dígitos completos.")
-        return AGUARDANDO_CODIGO
     else:
         await update.message.reply_text(
             f"❌ Código com {len(clean)} dígitos não reconhecido.\n"
@@ -222,7 +259,7 @@ async def receber_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Mostrar preview para confirmação
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar e enviar", callback_data=f"code:confirm:{clean}"),
+        [InlineKeyboardButton("✅ Confirmar e enviar", callback_data="code:confirm"),
          InlineKeyboardButton("✏️ Digitar de novo", callback_data="code:retype")],
     ])
     ctx.user_data["code_pending"] = clean
@@ -257,10 +294,10 @@ async def confirmar_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✏️ Digite o código novamente ({tipo_label}):")
         return AGUARDANDO_CODIGO
 
-    if not data.startswith("code:confirm:"):
+    if data != "code:confirm":
         return AGUARDANDO_CONFIRM
 
-    clean      = data.replace("code:confirm:", "")
+    clean      = ctx.user_data.get("code_pending", "")
     username   = ctx.user_data.get("challenge_username", "")
     password   = ctx.user_data.get("challenge_password", "")
     ig: InstagramClient = ctx.user_data.get("challenge_ig")
@@ -276,23 +313,11 @@ async def confirmar_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sucesso = await asyncio.get_event_loop().run_in_executor(
             None, ig.submit_backup_code, clean)
     else:
-        result = ig.submit_code(clean)
+        result = await asyncio.to_thread(ig.submit_code, clean)
         if result == "ok":
             sucesso = True
-        elif result == "pending":
-            await asyncio.sleep(5)
-            sucesso = ig.is_logged_in()
         else:
-            # Tentar login direto
-            try:
-                sucesso = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: ig.cl.login(username, password, verification_code=clean)
-                )
-                if sucesso:
-                    ig._save_session()
-            except Exception as e:
-                logger.error(f"Erro ao confirmar código: {e}")
-                sucesso = False
+            sucesso = False
 
     if sucesso:
         _salvar_conta(ig, username, password)
@@ -304,7 +329,7 @@ async def confirmar_codigo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await query.message.reply_text(
             f"❌ Código inválido ou expirado para *@{username}*.\n"
-            f"Use `/conta_add @{username} {password}` para tentar novamente.",
+            "Use `/conta_add` novamente para tentar outra vez.",
             parse_mode="Markdown")
 
     ctx.user_data.clear()
@@ -328,11 +353,21 @@ async def receber_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     import re as _re
     clean = _re.sub(r"[\s\-]+", "", code_raw)
+    if not re.fullmatch(r"\d{6}|\d{8}", clean):
+        await update.message.reply_text(
+            "❌ Código inválido. Digite 6 dígitos do autenticador ou 8 do backup."
+        )
+        return AGUARDANDO_2FA
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     preview = format_preview(clean)
+    ctx.user_data["two_factor_code_pending"] = clean
 
     # Preview antes de enviar
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar", callback_data=f"2fa:confirm:{clean}"),
+        [InlineKeyboardButton("✅ Confirmar", callback_data="2fa:confirm"),
          InlineKeyboardButton("✏️ Redigitar", callback_data="2fa:retype")],
     ])
     await update.message.reply_text(
@@ -354,10 +389,10 @@ async def confirmar_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✏️ Digite o código 2FA novamente:")
         return AGUARDANDO_2FA
 
-    if not data.startswith("2fa:confirm:"):
+    if data != "2fa:confirm":
         return AGUARDANDO_CONFIRM
 
-    clean    = data.replace("2fa:confirm:", "")
+    clean    = ctx.user_data.get("two_factor_code_pending", "")
     username = ctx.user_data.get("challenge_username", "")
     password = ctx.user_data.get("challenge_password", "")
     ig: InstagramClient = ctx.user_data.get("challenge_ig")
@@ -372,7 +407,7 @@ async def confirmar_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await query.message.reply_text(
             f"❌ Código 2FA incorreto.\n"
-            f"Use `/conta_add @{username} {password}` para tentar novamente.",
+            "Use `/conta_add` novamente para tentar outra vez.",
             parse_mode="Markdown")
 
     ctx.user_data.clear()
@@ -382,8 +417,8 @@ async def confirmar_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Helper ──────────────────────────────────────────────────
 
 def _salvar_conta(ig: InstagramClient, username: str, password: str):
-    if not accounts_db.get_account(username):
-        accounts_db.add_account(username, password, ig._fingerprint)
+    # add_account tambem atualiza as credenciais quando a conta ja existe.
+    accounts_db.add_account(username, password, ig._fingerprint)
     data = ig.get_session_data()
     if data:
         accounts_db.save_session_backup(username, data)
@@ -466,7 +501,9 @@ async def cmd_conta_fingerprint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ig = InstagramClient(username, acc["password"])
     ig.randomize_fingerprint()
-    await update.message.reply_text(f"🔀 UUIDs randomizados para @{username}.")
+    await update.message.reply_text(
+        f"✅ Identidade de dispositivo estável confirmada para @{username}."
+    )
 
 
 async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

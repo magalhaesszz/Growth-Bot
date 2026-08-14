@@ -2,6 +2,7 @@ import logging
 from collections import deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from config import (
     RISK_ERROR_RATE_THRESHOLD,
@@ -10,6 +11,7 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 @dataclass
@@ -42,13 +44,13 @@ class RiskDetector:
     def record_success(self, username: str):
         state = self._state(username)
         state.action_window.append(True)
-        state.last_action_at = datetime.utcnow()
+        state.last_action_at = datetime.now(LOCAL_TZ).replace(tzinfo=None)
         state.consecutive_errors = 0
 
     def record_error(self, username: str, error: Exception):
         state = self._state(username)
         state.action_window.append(False)
-        state.last_action_at = datetime.utcnow()
+        state.last_action_at = datetime.now(LOCAL_TZ).replace(tzinfo=None)
         state.consecutive_errors += 1
 
         error_str = str(error).lower()
@@ -94,7 +96,7 @@ class RiskDetector:
         Chame periodicamente (ex: a cada 30 min pelo scheduler).
         """
         state = self._state(username)
-        now = datetime.utcnow()
+        now = datetime.now(LOCAL_TZ).replace(tzinfo=None)
         hour_now = now.hour
 
         if not (hour_start <= hour_now < hour_end):
@@ -153,3 +155,7 @@ class RiskDetector:
 
     def get_all_statuses(self) -> list[dict]:
         return [self.get_status(u) for u in self._states]
+
+
+# Uma única instância deve ser usada pelo scheduler e pelo painel.
+risk_detector = RiskDetector()

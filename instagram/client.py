@@ -1,7 +1,8 @@
+import hashlib
+import hmac
 import json
 import logging
 import re
-import time
 import uuid
 from pathlib import Path
 
@@ -16,17 +17,32 @@ from instagrapi.exceptions import (
     ReloginAttemptExceeded,
     TwoFactorRequired,
 )
+from instagrapi.mixins.bloks import (
+    AP_2SV_CODE_ENTRY,
+    AP_2SV_CODE_ENTRY_ASYNC,
+    AP_2SV_ENTRYPOINT,
+)
 
-from config import SESSIONS_DIR
+from config import (
+    INSTAGRAM_COUNTRY,
+    INSTAGRAM_COUNTRY_CODE,
+    INSTAGRAM_LOCALE,
+    INSTAGRAM_PROXY,
+    INSTAGRAM_USE_PROXY,
+    INSTAGRAM_TIMEZONE_OFFSET,
+    SESSION_ENCRYPTION_KEY,
+    SESSIONS_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
-# {username: {"client": InstagramClient, "code": None|str, "choice": str}}
+# Estado temporário das verificações em andamento. Nunca contém senha ou código.
 PENDING_CHALLENGES: dict[str, dict] = {}
 
 
 def _normalize_code(code: str) -> str:
     return re.sub(r"[\s\-]+", "", str(code).strip())
+
 
 def _detect_code_type(code: str) -> str:
     clean = _normalize_code(code)
@@ -36,209 +52,241 @@ def _detect_code_type(code: str) -> str:
         return "sms_or_totp"
     return "unknown"
 
+
 def _format_preview(code: str) -> str:
     clean = _normalize_code(code)
-    tipo = _detect_code_type(clean)
-    if tipo == "backup":
+    if len(clean) == 8:
         return f"{clean[:4]}-{clean[4:]}"
-    if tipo == "sms_or_totp":
+    if len(clean) == 6:
         return f"{clean[:3]}-{clean[3:]}"
     return clean
 
 
 class InstagramClient:
+    """Cliente Instagram com identidade estável e verificação não bloqueante."""
+
     def __init__(self, username: str, password: str, device_fingerprint: dict = None):
-        self.username = username
+        self.username = username.strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", self.username):
+            raise ValueError("Nome de usuario do Instagram invalido.")
         self.password = password
-        self.session_path = Path(SESSIONS_DIR) / f"{username}.json"
-        self._fingerprint = {"device": "Pixel 8 Pro (padrao instagrapi)"}
-        # Criar Client UMA vez — não recriar, preserva estado CAA
-        self.cl = Client()
-        # Configurar proxy se definido (necessário quando IP do servidor é bloqueado)
-        from config import INSTAGRAM_PROXY
-        if INSTAGRAM_PROXY:
-            self.cl.set_proxy(INSTAGRAM_PROXY)
-            logger.info(f'[{username}] Proxy configurado: {INSTAGRAM_PROXY.split("@")[-1]}')
-        # Substituir challenge_code_handler — intercepta pedido de código
-        self.cl.challenge_code_handler = self._telegram_code_handler
+        self.session_path = Path(SESSIONS_DIR) / f"{self.username}.json"
+        self._fingerprint = device_fingerprint or {
+            "device": "Pixel 8 Pro (perfil estável instagrapi)"
+        }
+        self._caa_send_result: dict | None = None
+        self._caa_submit_context: dict | None = None
+        self._verification_mode: str | None = None
+        self.cl = self._build_client()
 
-    # ─── Handler que aguarda código do Telegram ───────────────
+    def _stable_bytes(self, label: str) -> bytes:
+        key = str(SESSION_ENCRYPTION_KEY).encode("utf-8")
+        data = f"instagram:{self.username.casefold()}:{label}".encode("utf-8")
+        return hmac.new(key, data, hashlib.sha256).digest()
 
-    def _telegram_code_handler(self, username: str, choice=None) -> str:
-        """
-        O instagrapi chama isso automaticamente quando precisa de
-        verificação (email/SMS/backup). Aguarda 5 min pelo Telegram.
-        """
-        from instagrapi.mixins.challenge import ChallengeChoice
-        choice_label = {
-            ChallengeChoice.EMAIL: "email",
-            ChallengeChoice.SMS:   "sms",
-        }.get(choice, "email_ou_sms")
+    def _stable_uuid(self, label: str) -> str:
+        return str(uuid.UUID(bytes=self._stable_bytes(label)[:16], version=4))
 
-        logger.info(f"[{username}] Instagram pediu verificacao via {choice_label}")
-        logger.info(f"[{username}] Aguardando codigo no Telegram...")
+    def _apply_network_identity(self, client: Client) -> None:
+        # Impede que HTTP_PROXY/HTTPS_PROXY do servidor sejam usados por acidente.
+        for session_name in ("private", "public"):
+            session = getattr(client, session_name, None)
+            if session is not None and hasattr(session, "trust_env"):
+                session.trust_env = False
+        if INSTAGRAM_USE_PROXY and INSTAGRAM_PROXY:
+            client.set_proxy(INSTAGRAM_PROXY)
+            logger.info("[%s] Proxy explícita configurada.", self.username)
+        else:
+            logger.info("[%s] Conexão direta, sem proxy.", self.username)
+        client.set_country(INSTAGRAM_COUNTRY)
+        client.set_country_code(INSTAGRAM_COUNTRY_CODE)
+        client.set_locale(INSTAGRAM_LOCALE)
+        client.set_timezone_offset(INSTAGRAM_TIMEZONE_OFFSET)
 
-        PENDING_CHALLENGES[username] = {
+    def _build_client(self) -> Client:
+        client = Client()
+        client.set_uuids(
+            {
+                "phone_id": self._stable_uuid("phone_id"),
+                "uuid": self._stable_uuid("uuid"),
+                "client_session_id": self._stable_uuid("client_session_id"),
+                "advertising_id": self._stable_uuid("advertising_id"),
+                "android_device_id": "android-"
+                + self._stable_bytes("android_device_id").hex()[:16],
+                "request_id": self._stable_uuid("request_id"),
+                "tray_session_id": self._stable_uuid("tray_session_id"),
+            }
+        )
+        self._apply_network_identity(client)
+        return client
+
+    def _reset_pending(self) -> None:
+        PENDING_CHALLENGES.pop(self.username, None)
+        self._caa_send_result = None
+        self._caa_submit_context = None
+        self._verification_mode = None
+
+    def _register_pending(self, mode: str, choice: str = "email_ou_app") -> None:
+        self._verification_mode = mode
+        PENDING_CHALLENGES[self.username] = {
             "client": self,
-            "code": None,
-            "choice": choice_label,
+            "type": mode,
+            "choice": choice,
         }
 
-        elapsed = 0
-        while elapsed < 300:
-            entry = PENDING_CHALLENGES.get(username)
-            if entry and entry.get("code"):
-                code = _normalize_code(entry["code"])
-                PENDING_CHALLENGES.pop(username, None)
-                logger.info(f"[{username}] Codigo recebido e injetado: {code}")
-                return code
-            time.sleep(2)
-            elapsed += 2
-
-        PENDING_CHALLENGES.pop(username, None)
-        logger.error(f"[{username}] Timeout — codigo nao fornecido em 5 minutos.")
-        return ""
-
-    # ─── Login ────────────────────────────────────────────────
-
     def login(self) -> str:
-        """
-        Usa cl.login() do instagrapi que gerencia todo o fluxo:
-        legacy login → CAA fallback → challenge_code_handler (nosso).
-        Só capturamos BadPassword real e erros irrecuperáveis.
-        """
-        # Restaurar sessão salva
+        """Retorna imediatamente: ok, challenge, two_factor ou error:motivo."""
         if self.session_path.exists():
             try:
-                logger.info(f"[{self.username}] Restaurando sessao...")
                 self.cl.load_settings(str(self.session_path))
-                self.cl.login(self.username, self.password)
+                self._apply_network_identity(self.cl)
                 self.cl.get_timeline_feed()
-                logger.info(f"[{self.username}] Sessao restaurada com sucesso.")
+                logger.info("[%s] Sessão restaurada com sucesso.", self.username)
                 return "ok"
             except LoginRequired:
-                logger.warning(f"[{self.username}] Sessao expirada.")
-            except Exception as e:
-                logger.warning(f"[{self.username}] Erro ao restaurar: {e}")
+                logger.info("[%s] Sessão expirada; iniciando novo login.", self.username)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Sessão salva não pôde ser reutilizada: %s",
+                    self.username,
+                    type(exc).__name__,
+                )
+            self.cl = self._build_client()
+        return self._begin_caa_login()
 
-        return self._do_login()
-
-    def _do_login(self, verification_code: str = "") -> str:
+    def _begin_caa_login(self) -> str:
+        """Executa o CAA até a etapa anterior ao código e devolve o controle ao bot."""
         try:
-            logger.info(f"[{self.username}] Iniciando login...")
-            # login() gerencia: pre_login → accounts/login/ → CAA fallback
-            # → challenge_code_handler quando precisar de verificação
-            self.cl.login(self.username, self.password,
-                          verification_code=verification_code)
-            self._save_session()
-            logger.info(f"[{self.username}] Login concluido com sucesso.")
-            return "ok"
+            logger.info("[%s] Iniciando login CAA.", self.username)
+            if not self.cl.bloks_caa_login_prepare(username=self.username):
+                return "error:caa_preflight"
 
+            result = self.cl.bloks_caa_login_send_request(
+                self.password,
+                username=self.username,
+            )
+            if self.cl.bloks_apply_login_response(result):
+                self._save_session()
+                self._reset_pending()
+                return "ok"
+
+            if self.cl.bloks_caa_login_needs_two_step(result):
+                self._caa_send_result = result
+                if not self._prepare_caa_challenge(result):
+                    return "error:caa_challenge_prepare"
+                self._register_pending("caa")
+                return "challenge"
+            return "error:caa_failed"
         except TwoFactorRequired:
-            # Instagram pediu 2FA — usuário precisa fornecer código
-            logger.info(f"[{self.username}] 2FA requerido.")
-            PENDING_CHALLENGES[self.username] = {
-                "client": self, "code": None, "type": "2fa"
-            }
+            self._register_pending("2fa", "authenticator")
             return "two_factor"
-
-        except ChallengeRequired:
-            # challenge_code_handler foi chamado e está aguardando
-            # (já registrou em PENDING_CHALLENGES)
-            logger.info(f"[{self.username}] Challenge — aguardando codigo.")
-            return "challenge"
-
-        except BadPassword as e:
-            # BadPassword REAL — senha errada
-            # (se fosse CAA, _try_caa_login teria resolvido internamente)
-            logger.error(f"[{self.username}] Senha incorreta: {e}")
+        except BadPassword:
             return "error:bad_password"
-
         except (PleaseWaitFewMinutes, RateLimitError):
             return "error:rate_limit"
-
         except FeedbackRequired:
             return "error:feedback_required"
-
         except ReloginAttemptExceeded:
             return "error:relogin_exceeded"
-
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "too many" in err or "retry" in err:
+        except Exception as exc:
+            message = str(exc).lower()
+            if "407" in message or "proxy" in message:
+                return "error:proxy"
+            if "429" in message or "too many" in message or "retry" in message:
                 return "error:rate_limit_429"
-            logger.error(f"[{self.username}] Erro: {type(e).__name__}: {e}")
-            return f"error:{type(e).__name__}: {e}"
+            logger.error("[%s] Erro CAA: %s", self.username, type(exc).__name__)
+            return f"error:{type(exc).__name__}"
+
+    def _prepare_caa_challenge(self, send_result: dict) -> bool:
+        entry_context = self.cl.bloks_extract_context_data(
+            send_result, AP_2SV_ENTRYPOINT
+        )
+        if not entry_context:
+            return False
+        entry_result = self.cl.bloks_ap_two_step_verification_entrypoint(entry_context)
+        code_context = self.cl.bloks_extract_context_data(
+            entry_result, AP_2SV_CODE_ENTRY
+        )
+        if not code_context:
+            return False
+        code_result = self.cl.bloks_ap_two_step_verification_code_entry(code_context)
+        self._caa_submit_context = self.cl.bloks_extract_context_data(
+            code_result, AP_2SV_CODE_ENTRY_ASYNC
+        )
+        return bool(self._caa_submit_context)
+
+    def _submit_caa_code(self, code: str) -> bool:
+        clean = _normalize_code(code)
+        if _detect_code_type(clean) == "unknown" or not self._caa_submit_context:
+            return False
+        try:
+            result = self.cl.bloks_ap_two_step_verification_submit_code(
+                self._caa_submit_context,
+                clean,
+            )
+            if self.cl.bloks_apply_login_response(result):
+                self._save_session()
+                self._reset_pending()
+                return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Código CAA rejeitado: %s", self.username, type(exc).__name__
+            )
+        return False
 
     def start_challenge_with_method(self, method_type: str) -> str:
-        """Reinicia o login — challenge_code_handler aguardará o código."""
-        return self._do_login()
-
-    # ─── Submissão de código ──────────────────────────────────
+        # O fluxo CAA atual escolhe o canal no servidor.
+        if self._caa_submit_context:
+            return "challenge"
+        return self._begin_caa_login()
 
     def submit_code(self, code: str) -> str:
-        """Injeta código no challenge_code_handler que está aguardando."""
-        clean = _normalize_code(code)
-        entry = PENDING_CHALLENGES.get(self.username)
-        if entry is not None:
-            entry["code"] = clean
-            return "pending"
-        return "error"
+        return "ok" if self._submit_caa_code(code) else "error"
 
     def submit_backup_code(self, code: str) -> bool:
-        """Submete backup code de 8 dígitos."""
         clean = _normalize_code(code)
-        logger.info(f"[{self.username}] Submetendo backup code: {clean}")
-
-        # Se challenge_code_handler está aguardando, injetar
-        entry = PENDING_CHALLENGES.get(self.username)
-        if entry is not None:
-            entry["code"] = clean
-            for _ in range(8):
-                time.sleep(2)
-                if self.username not in PENDING_CHALLENGES:
-                    return self.is_logged_in()
-            return self.is_logged_in()
-
-        # Tentar login direto com código de backup
-        try:
-            self.cl.login(self.username, self.password, verification_code=clean)
-            self._save_session()
-            return True
-        except Exception as e:
-            logger.error(f"[{self.username}] Erro backup code: {e}")
-        return False
+        if len(clean) != 8:
+            return False
+        if self._caa_submit_context:
+            return self._submit_caa_code(clean)
+        return self.submit_2fa(clean)
 
     def submit_2fa(self, code: str) -> bool:
-        """Submete código de 2FA."""
         clean = _normalize_code(code)
+        if _detect_code_type(clean) == "unknown":
+            return False
+        if self._caa_submit_context:
+            return self._submit_caa_code(clean)
         try:
-            self.cl.login(self.username, self.password, verification_code=clean)
-            self._save_session()
-            PENDING_CHALLENGES.pop(self.username, None)
-            return True
-        except Exception as e:
-            logger.error(f"[{self.username}] Erro 2FA: {e}")
+            if self.cl.login(self.username, self.password, verification_code=clean):
+                self._save_session()
+                self._reset_pending()
+                return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Código 2FA rejeitado: %s", self.username, type(exc).__name__
+            )
         return False
 
-    # ─── Sessão ──────────────────────────────────────────────
-
-    def _save_session(self):
+    def _save_session(self) -> None:
+        self.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.cl.dump_settings(str(self.session_path))
 
-    def save_session(self):
+    def save_session(self) -> None:
         self._save_session()
 
     def get_session_data(self) -> dict:
         if self.session_path.exists():
-            with open(self.session_path) as f:
-                return json.load(f)
+            with self.session_path.open(encoding="utf-8") as session_file:
+                return json.load(session_file)
         return {}
 
-    def load_session_from_data(self, data: dict):
-        with open(str(self.session_path), "w") as f:
-            json.dump(data, f)
+    def load_session_from_data(self, data: dict) -> None:
+        self.session_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.session_path.open("w", encoding="utf-8") as session_file:
+            json.dump(data, session_file)
         self.cl.load_settings(str(self.session_path))
+        self._apply_network_identity(self.cl)
 
     def is_logged_in(self) -> bool:
         try:
@@ -248,17 +296,11 @@ class InstagramClient:
             return False
 
     def ensure_logged_in(self) -> bool:
-        if not self.is_logged_in():
-            return self.login() == "ok"
-        return True
+        return self.is_logged_in() or self.login() == "ok"
 
     def randomize_fingerprint(self):
-        self.cl.set_settings({
-            "device_id": f"android-{uuid.uuid4().hex[:16]}",
-            "uuid": str(uuid.uuid4()),
-            "phone_id": str(uuid.uuid4()),
-        })
-        return self._fingerprint
+        # Mantido por compatibilidade: a identidade deve permanecer estável.
+        return self._fingerprint.copy()
 
     @property
     def api(self) -> Client:
@@ -267,6 +309,7 @@ class InstagramClient:
 
 def detect_code_type(code: str) -> str:
     return _detect_code_type(code)
+
 
 def format_preview(code: str) -> str:
     return _format_preview(code)

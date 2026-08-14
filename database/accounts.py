@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from supabase import create_client, Client
 
@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS ig_accounts (
     delay_max       INTEGER DEFAULT 90,
     score_min       INTEGER DEFAULT 50,
     unfollow_after_days INTEGER DEFAULT 5,
+    unfollow_policy TEXT DEFAULT 'keep_follow_backs',
+    daily_report_enabled BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ DEFAULT now(),
     last_active_at  TIMESTAMPTZ
 );
@@ -152,8 +154,18 @@ class AccountsDB:
             "status": "warming",
             "warmup_day": 1,
         }
-        res = self.sb.table("ig_accounts").insert(data).execute()
-        logger.info(f"Conta adicionada: {username}")
+        existing = self.sb.table("ig_accounts").select("id").eq(
+            "username", username
+        ).limit(1).execute()
+        if existing.data:
+            res = self.sb.table("ig_accounts").update({
+                "password_enc": data["password_enc"],
+                "fingerprint": fingerprint,
+            }).eq("username", username).execute()
+            logger.info("Credenciais atualizadas para: %s", username)
+        else:
+            res = self.sb.table("ig_accounts").insert(data).execute()
+            logger.info("Conta adicionada: %s", username)
         return res.data[0] if res.data else {}
 
     def get_account(self, username: str) -> dict | None:
@@ -195,13 +207,14 @@ class AccountsDB:
 
     def update_last_active(self, username: str):
         self.sb.table("ig_accounts").update(
-            {"last_active_at": datetime.utcnow().isoformat()}
+            {"last_active_at": datetime.now(timezone.utc).isoformat()}
         ).eq("username", username).execute()
 
     def update_settings(self, username: str, settings: dict):
         allowed = {
             "daily_follows", "daily_unfollows", "hour_start", "hour_end",
-            "delay_min", "delay_max", "score_min", "unfollow_after_days"
+            "delay_min", "delay_max", "score_min", "unfollow_after_days",
+            "unfollow_policy", "daily_report_enabled",
         }
         payload = {k: v for k, v in settings.items() if k in allowed}
         self.sb.table("ig_accounts").update(payload).eq("username", username).execute()

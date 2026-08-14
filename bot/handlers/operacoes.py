@@ -5,14 +5,13 @@ from telegram.ext import ContextTypes, CommandHandler
 
 from database.accounts import AccountsDB
 from database.operations import DB
-from instagram.risk_detector import RiskDetector
+from instagram.risk_detector import risk_detector
 from reports.daily import ReportGenerator
 from config import TELEGRAM_OWNER_ID
 
 logger = logging.getLogger(__name__)
 accounts_db = AccountsDB()
 db = DB()
-risk_detector = RiskDetector()
 reporter = ReportGenerator()
 
 
@@ -52,6 +51,12 @@ async def cmd_alvo_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from instagram.scraper import Scraper
     ig = InstagramClient(acc["username"], acc["password"])
     result_login = ig.login()
+    if result_login != "ok":
+        await update.message.reply_text(
+            f"❌ Não foi possível autenticar @{acc['username']}: `{result_login}`",
+            parse_mode="Markdown",
+        )
+        return
     page = Scraper(ig).resolve_page(url)
     if not page:
         await update.message.reply_text("❌ Página não encontrada no Instagram.")
@@ -153,6 +158,8 @@ async def cmd_score_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     try:
         score = int(ctx.args[-1])
+        if not 0 <= score <= 100:
+            raise ValueError
         acc = _first_account(ctx.args[0] if len(ctx.args) > 1 else None)
         if acc:
             accounts_db.update_settings(acc["username"], {"score_min": score})

@@ -13,3 +13,9 @@ ALTER TABLE ig_accounts
         'keep_follow_backs',
         'remove_only_follow_backs'
     ));
+
+CREATE TABLE IF NOT EXISTS video_settings (
+    user_id BIGINT PRIMARY KEY,
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

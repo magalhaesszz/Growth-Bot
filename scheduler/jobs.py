@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -13,14 +15,11 @@ from instagram.follower import Follower
 from instagram.unfollower import Unfollower
 from instagram.stories import StoriesViewer
 from instagram.score import ProfileScorer, BlacklistFilter, WhitelistFilter
-from instagram.risk_detector import RiskDetector
+from instagram.risk_detector import risk_detector
 from scheduler.warmup import advance_all_warmups, get_warmup_limit
 from scheduler.anomaly import check_all_anomalies
 
 logger = logging.getLogger(__name__)
-
-# Instância global compartilhada entre todos os jobs
-risk_detector = RiskDetector()
 
 # Referência ao app Telegram (injetada em setup_scheduler)
 _telegram_app = None
@@ -46,7 +45,11 @@ def _get_daily_limit(account: dict) -> int:
     return account.get("daily_follows", 40)
 
 
-async def run_follow_job():
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def _run_follow_job_sync() -> list[str]:
+    notifications: list[str] = []
     accounts_db = AccountsDB()
     db = DB()
     accounts = accounts_db.list_active_accounts()
@@ -58,14 +61,16 @@ async def run_follow_job():
             logger.warning(f"[{username}] Pausada — pulando follow job.")
             continue
 
-        now_hour = datetime.utcnow().hour
+        now_hour = datetime.now(LOCAL_TZ).hour
         if not (acc["hour_start"] <= now_hour < acc["hour_end"]):
             continue
 
         ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
         result = ig.login()
         if result != "ok":
-            await _notify(f"❌ Falha de login — *@{username}*. Verifique as credenciais.")
+            notifications.append(
+                f"❌ Falha de login — *@{username}* (`{result}`)."
+            )
             continue
 
         targets = db.list_targets(acc["id"])
@@ -78,7 +83,12 @@ async def run_follow_job():
         scorer = ProfileScorer()
         follower = Follower(ig, risk_detector, scorer, bl_filter)
 
-        daily_limit = _get_daily_limit(acc)
+        configured_limit = _get_daily_limit(acc)
+        already_today = db.count_today_follows(acc["id"])
+        daily_limit = max(0, configured_limit - already_today)
+        if daily_limit <= 0:
+            logger.info("[%s] Limite diário total já atingido.", username)
+            continue
         campaign = db.get_active_campaign(acc["id"])
         campaign_id = campaign["id"] if campaign else None
 
@@ -106,14 +116,18 @@ async def run_follow_job():
 
             def on_follow(uname, uid, _campaign_id=campaign_id, _acc=acc):
                 db.add_followed(_acc["id"], uid, uname, _campaign_id)
+                already_following.add(str(uid))
                 db.log_action(_acc["id"], "follow", uname, success=True)
                 if _campaign_id:
                     db.update_campaign_stats(_campaign_id, follows=1)
                 accounts_db.update_last_active(_acc["username"])
 
+            remaining_limit = max(0, daily_limit - total_followed)
+            if remaining_limit <= 0:
+                break
             result = follower.follow_batch(
                 profiles,
-                daily_limit=daily_limit,
+                daily_limit=remaining_limit,
                 min_score=acc.get("score_min", 50),
                 delay_min=acc.get("delay_min", 30),
                 delay_max=acc.get("delay_max", 90),
@@ -137,8 +151,16 @@ async def run_follow_job():
 
         logger.info(f"[{username}] Follow job finalizado — {total_followed} follows.")
 
+    return notifications
 
-async def run_unfollow_job():
+
+async def run_follow_job():
+    notifications = await asyncio.to_thread(_run_follow_job_sync)
+    for message in notifications:
+        await _notify(message)
+
+
+def _run_unfollow_job_sync():
     accounts_db = AccountsDB()
     db = DB()
     accounts = accounts_db.list_active_accounts()
@@ -178,14 +200,23 @@ async def run_unfollow_job():
 
         unfollower.unfollow_batch(
             candidates,
-            daily_limit=acc.get("daily_unfollows", 40),
+            daily_limit=max(
+                0,
+                acc.get("daily_unfollows", 40)
+                - db.count_today_unfollows(acc["id"]),
+            ),
             delay_min=acc.get("delay_min", 30),
             delay_max=acc.get("delay_max", 90),
             on_success=on_unfollow,
+            policy=acc.get("unfollow_policy", "keep_follow_backs"),
         )
 
 
-async def run_session_backup_job():
+async def run_unfollow_job():
+    await asyncio.to_thread(_run_unfollow_job_sync)
+
+
+def _run_session_backup_job_sync():
     accounts_db = AccountsDB()
     for acc in accounts_db.list_active_accounts():
         ig = InstagramClient(acc["username"], acc["password"], acc.get("fingerprint"))
@@ -193,6 +224,26 @@ async def run_session_backup_job():
         if data:
             accounts_db.save_session_backup(acc["username"], data)
     logger.info("Backup de sessões concluído.")
+
+
+async def run_session_backup_job():
+    await asyncio.to_thread(_run_session_backup_job_sync)
+
+
+async def run_daily_report_job():
+    accounts_db = AccountsDB()
+    db = DB()
+    for acc in await asyncio.to_thread(accounts_db.list_active_accounts):
+        if not acc.get("daily_report_enabled", True):
+            continue
+        stats = await asyncio.to_thread(db.get_stats_today, acc["id"])
+        await _notify(
+            f"📊 *Relatório diário — @{acc['username']}*\n\n"
+            f"Follows: *{stats.get('follow', 0)}*\n"
+            f"Unfollows: *{stats.get('unfollow', 0)}*\n"
+            f"Stories: *{stats.get('story_view', 0)}*\n"
+            f"Erros: *{stats.get('error', 0)}*"
+        )
 
 
 async def run_warmup_job():
@@ -223,5 +274,8 @@ def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
 
     # Detector de anomalias — a cada 30 minutos
     scheduler.add_job(run_anomaly_check, CronTrigger(minute="*/30"), id="anomaly_check")
+
+    # Relatório diário após o encerramento da janela padrão.
+    scheduler.add_job(run_daily_report_job, CronTrigger(hour=22, minute=15), id="daily_report")
 
     return scheduler

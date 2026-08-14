@@ -1,15 +1,17 @@
+import asyncio
 import json
 import logging
 import os
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ContextTypes, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, CommandHandler, MessageHandler,
     ConversationHandler, filters,
 )
 
 from config import TELEGRAM_OWNER_ID
 import video_client as vc
+import video_settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,8 @@ logger = logging.getLogger(__name__)
 AGUARDANDO_FUNDO  = 10
 AGUARDANDO_VIDEO  = 11
 AGUARDANDO_LOTE   = 12
-
-# Config de vídeo por usuário (em memória — persiste enquanto bot rodar)
-_user_cfg: dict[int, dict] = {}
-
+AGUARDANDO_EDITOR = 13
+AGUARDANDO_EDITOR_APPLY = 14
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -37,7 +37,7 @@ def _account_id(update: Update) -> str:
 
 
 def _cfg(update: Update) -> dict:
-    return _user_cfg.get(update.effective_user.id, {})
+    return video_settings.get_config(update.effective_user.id)
 
 
 # ─── /fundo ──────────────────────────────────────────────────
@@ -69,7 +69,9 @@ async def receber_fundo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text("⏳ Salvando fundo...")
 
-    result = vc.salvar_fundo(bytes(fundo_bytes), filename, _account_id(update))
+    result = await asyncio.to_thread(
+        vc.salvar_fundo, bytes(fundo_bytes), filename, _account_id(update)
+    )
     if result["ok"]:
         await msg.reply_text("✅ Fundo salvo com sucesso!\nAgora use /video para processar um vídeo.")
     else:
@@ -117,11 +119,12 @@ async def receber_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     file_obj    = await file_ref.get_file()
     video_bytes = await file_obj.download_as_bytearray()
 
-    result = vc.processar_video(
-        video_bytes=bytes(video_bytes),
-        filename=filename,
-        account_id=_account_id(update),
-        cfg=_cfg(update),
+    result = await asyncio.to_thread(
+        vc.processar_video,
+        bytes(video_bytes),
+        filename,
+        _account_id(update),
+        _cfg(update),
     )
 
     if result["ok"]:
@@ -201,7 +204,9 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"⏳ Processando {len(lote)} vídeo(s)...")
 
-    result = vc.processar_lote(lote, _account_id(update), _cfg(update))
+    result = await asyncio.to_thread(
+        vc.processar_lote, lote, _account_id(update), _cfg(update)
+    )
 
     if not result.get("resultados"):
         await update.message.reply_text(f"❌ Erro: {result.get('error')}")
@@ -209,7 +214,9 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     for item in result["resultados"]:
         if item["ok"]:
-            video_bytes = vc.download_lote_video(item["job_id"])
+            video_bytes = await asyncio.to_thread(
+                vc.download_lote_video, item["job_id"]
+            )
             if video_bytes:
                 await update.message.reply_video(
                     video=video_bytes,
@@ -231,7 +238,7 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Consultando API...")
-    status = vc.api_status()
+    status = await asyncio.to_thread(vc.api_status)
     if status.get("ok"):
         await update.message.reply_text(
             f"📡 *Status da Video API*\n\n"
@@ -252,11 +259,11 @@ async def cmd_video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    cfg = _user_cfg.get(uid, {})
+    cfg = video_settings.get_config(uid)
 
     if not ctx.args:
-        defaults = vc.config_default()
-        atual = {**defaults, **cfg}
+        defaults = await asyncio.to_thread(vc.config_default)
+        atual = {**(defaults if defaults.get("ok", True) else {}), **cfg}
         linhas = [
             "⚙️ *Configurações do editor de vídeo:*\n",
             f"  Largura do vídeo: `{atual.get('video_width', 800)}px`",
@@ -294,7 +301,11 @@ async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: cfg[k] = int(v)
             except: cfg[k] = v
 
-    _user_cfg[uid] = cfg
+    try:
+        cfg = video_settings.set_values(uid, cfg)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
     await update.message.reply_text(
         f"✅ Configuração atualizada:\n" +
         "\n".join(f"  `{k}` = `{v}`" for k, v in cfg.items()),
@@ -306,7 +317,7 @@ async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_config_video_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    _user_cfg.pop(update.effective_user.id, None)
+    video_settings.reset(update.effective_user.id)
     await update.message.reply_text("✅ Configurações de vídeo resetadas para o padrão.")
 
 
@@ -314,11 +325,114 @@ async def cmd_config_video_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def cmd_video_limpar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    result = vc.limpar_tmp()
+    result = await asyncio.to_thread(vc.limpar_tmp)
     if result.get("ok"):
         await update.message.reply_text(f"🗑 {result.get('removidos', 0)} arquivo(s) removido(s) do servidor.")
     else:
         await update.message.reply_text(f"❌ Erro: {result.get('error')}")
+
+
+# ─── /video_editor — preview arrastável ──────────────────────
+
+@owner_only
+async def cmd_video_editor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎛 *Editor visual*\n\n"
+        "Envie um vídeo .mp4. Depois você poderá mover o vídeo com o mouse "
+        "ou com o dedo e ajustar o tamanho antes de processar.",
+        parse_mode="Markdown",
+    )
+    return AGUARDANDO_EDITOR
+
+
+async def receber_video_editor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    media = msg.video or msg.document
+    filename = getattr(media, "file_name", None) or "video_editor.mp4"
+    if not media or not filename.lower().endswith(".mp4"):
+        await msg.reply_text("❌ Envie um vídeo .mp4.")
+        return AGUARDANDO_EDITOR
+
+    await msg.reply_text("⏳ Preparando o preview interativo...")
+    file_obj = await media.get_file()
+    video_bytes = bytes(await file_obj.download_as_bytearray())
+    result = await asyncio.to_thread(
+        vc.criar_editor_session,
+        video_bytes,
+        filename,
+        _account_id(update),
+        _cfg(update),
+    )
+    if not result.get("ok"):
+        await msg.reply_text(f"❌ Não foi possível abrir o editor: {result.get('error')}")
+        return ConversationHandler.END
+
+    token = result["token"]
+    ctx.user_data["video_editor_source"] = (video_bytes, filename)
+    ctx.user_data["video_editor_token"] = token
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖐 Abrir editor visual", url=result["editor_url"])],
+        [InlineKeyboardButton(
+            "✅ Aplicar posição e processar",
+            callback_data=f"video:editor_apply:{token}",
+        )],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="video:editor_cancel")],
+    ])
+    await msg.reply_text(
+        "✅ Preview pronto. Abra o editor, arraste e redimensione o vídeo, "
+        "toque em *Salvar* e depois volte aqui para aplicar.",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return AGUARDANDO_EDITOR_APPLY
+
+
+async def aplicar_video_editor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "video:editor_cancel":
+        ctx.user_data.pop("video_editor_source", None)
+        ctx.user_data.pop("video_editor_token", None)
+        await query.edit_message_text("❌ Editor cancelado.")
+        return ConversationHandler.END
+
+    token = query.data.rsplit(":", 1)[-1]
+    source = ctx.user_data.get("video_editor_source")
+    if not source or token != ctx.user_data.get("video_editor_token"):
+        await query.edit_message_text("❌ Sessão do editor expirada. Use /video_editor novamente.")
+        return ConversationHandler.END
+
+    await query.edit_message_text("⏳ Aplicando a posição e processando o vídeo...")
+    editor = await asyncio.to_thread(vc.obter_editor_result, token)
+    if not editor.get("ok"):
+        await query.message.reply_text(f"❌ Editor expirado: {editor.get('error')}")
+        return ConversationHandler.END
+
+    editable = {
+        key: value
+        for key, value in editor["config"].items()
+        if key in video_settings.DEFAULTS
+    }
+    config = video_settings.set_values(update.effective_user.id, editable)
+    video_bytes, filename = source
+    result = await asyncio.to_thread(
+        vc.processar_video,
+        video_bytes,
+        filename,
+        _account_id(update),
+        config,
+    )
+    if result.get("ok"):
+        await query.message.reply_video(
+            video=result["video_bytes"],
+            filename=result["filename"],
+            caption=f"✅ Vídeo processado com o layout visual — {result['size_mb']} MB",
+        )
+    else:
+        await query.message.reply_text(f"❌ Falha no processamento: {result.get('error')}")
+    ctx.user_data.pop("video_editor_source", None)
+    ctx.user_data.pop("video_editor_token", None)
+    return ConversationHandler.END
 
 
 # ─── /cancelar ───────────────────────────────────────────────
@@ -338,6 +452,21 @@ def register_video_handlers(app):
         states={
             AGUARDANDO_FUNDO: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receber_fundo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_user=True,
+        per_message=False,
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("video_editor", cmd_video_editor)],
+        states={
+            AGUARDANDO_EDITOR: [
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receber_video_editor),
+            ],
+            AGUARDANDO_EDITOR_APPLY: [
+                CallbackQueryHandler(aplicar_video_editor, pattern=r"^video:editor_"),
             ],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
