@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from functools import wraps
 
@@ -8,16 +7,16 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Mes
 from config import TELEGRAM_OWNER_ID, WARMUP_SCHEDULE
 from database.accounts import AccountsDB
 from database.operations import DB
-from instagram.risk_detector import get_risk_detector
-risk_detector = get_risk_detector()
+from instagram.risk_detector import RiskDetector
+risk_detector = RiskDetector()
 from action_queue.action_queue import ActionQueue
 import video_client as vc
-import video_settings as vs
 
 logger = logging.getLogger(__name__)
 
 accounts_db = AccountsDB()
 db = DB()
+_video_user_cfg: dict[int, dict] = {}
 
 UNFOLLOW_POLICY_LABELS = {
     "remove_all": "Remover todos",
@@ -135,7 +134,6 @@ def _video_keyboard() -> InlineKeyboardMarkup:
         [_button("Status da API", "dash:video:status")],
         [_button("Enviar fundo", "dash:video:set_fundo"), _button("Ver fundo", "dash:video:get_fundo")],
         [_button("Processar video", "dash:video:process"), _button("Modo lote", "dash:video:lote")],
-        [_button("Editor livre (arrastar)", "dash:video:editor")],
         [_button("Configuracoes", "dash:video:config"), _button("Reset config", "dash:video:config_reset")],
         [_button("Limpar temp", "dash:video:limpar")],
         [_button("Voltar", "dash:home"), _button("Atualizar", "dash:video")],
@@ -156,12 +154,12 @@ def _video_home_text() -> str:
     return (
         "*Editor de Video*\n\n"
         "Envie um fundo 1080x1920 e depois escolha entre processar um video "
-        "diretamente, usar o modo lote ou posicionar livremente com mouse/dedo."
+        "ou usar o modo lote."
     )
 
 
-async def _video_status_text() -> str:
-    status = await asyncio.to_thread(vc.api_status)
+def _video_status_text() -> str:
+    status = vc.api_status()
     if not status.get("ok"):
         return f"*Video API indisponivel*\n\n`{status.get('error', 'Erro desconhecido')}`"
     return (
@@ -280,10 +278,7 @@ def _account_text(username: str) -> str:
     targets = db.list_targets(acc["id"])
     campaign = db.get_active_campaign(acc["id"])
     risk = risk_detector.get_status(username)
-    policy = UNFOLLOW_POLICY_LABELS.get(
-        acc.get("unfollow_policy", "keep_follow_backs"),
-        "Manter follow backs",
-    )
+    policy = UNFOLLOW_POLICY_LABELS.get(acc.get("unfollow_policy", "remove_all"), "Remover todos")
     return (
         f"*Conta @{username}*\n\n"
         f"Status: `{acc['status']}`\n"
@@ -342,10 +337,7 @@ def _config_text(ctx: ContextTypes.DEFAULT_TYPE) -> str:
     acc = _selected_account(ctx)
     if not acc:
         return "*Config*\n\nNenhuma conta cadastrada."
-    policy = UNFOLLOW_POLICY_LABELS.get(
-        acc.get("unfollow_policy", "keep_follow_backs"),
-        "Manter follow backs",
-    )
+    policy = UNFOLLOW_POLICY_LABELS.get(acc.get("unfollow_policy", "remove_all"), "Remover todos")
     return (
         f"*Configuracoes de @{acc['username']}*\n\n"
         f"Follows/dia: *{acc.get('daily_follows', 40)}*\n"
@@ -466,7 +458,7 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Actions que nao precisam de conta Instagram
         ACTIONS_SEM_CONTA = {
             "usuarios_add", "usuarios_remove", "usuarios_add_admin",
-            "video_fundo", "video_process", "video_lote", "video_editor",
+            "video_fundo", "video_process", "video_lote",
             "video_cfg_width", "video_cfg_pos", "video_cfg_crf",
         }
         acc = None
@@ -503,26 +495,26 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif action == "video_fundo":
             # recebe arquivo via texto (link) — para imagens enviadas como arquivo, o handler de vídeo trata
             await update.message.reply_text("Envie a imagem diretamente como foto ou arquivo no chat.")
-        elif action in {"video_process", "video_editor"}:
+        elif action == "video_process":
             await update.message.reply_text("Envie o .mp4 diretamente no chat para processar.")
         elif action == "video_lote":
             # coleta videos
             await update.message.reply_text("Envie os .mp4 um a um. Quando terminar, clique em 'Processar lote agora'.")
         elif action == "video_cfg_width":
             try:
-                vs.set_values(update.effective_user.id, {"video_width": text})
+                _video_user_cfg.setdefault(update.effective_user.id, {})["video_width"] = int(text)
                 await update.message.reply_text(f"Largura atualizada: {text}px.")
             except ValueError:
                 await update.message.reply_text("Envie um numero inteiro (ex: 800).")
         elif action == "video_cfg_pos":
             try:
-                vs.set_values(update.effective_user.id, {"position_y": text})
+                _video_user_cfg.setdefault(update.effective_user.id, {})["position_y"] = float(text)
                 await update.message.reply_text(f"Posicao atualizada: {text}.")
             except ValueError:
                 await update.message.reply_text("Envie um numero decimal (ex: 0.25).")
         elif action == "video_cfg_crf":
             try:
-                vs.set_values(update.effective_user.id, {"output_crf": text})
+                _video_user_cfg.setdefault(update.effective_user.id, {})["output_crf"] = int(text)
                 await update.message.reply_text(f"CRF atualizado: {text}.")
             except ValueError:
                 await update.message.reply_text("Envie um numero inteiro (ex: 18).")
@@ -544,11 +536,11 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_dashboard_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not _user_role(update.effective_user.id):
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
         return
 
     action = ctx.user_data.get("dashboard_pending")
-    if action not in {"video_fundo", "video_process", "video_lote", "video_editor"}:
+    if action not in {"video_fundo", "video_process", "video_lote"}:
         return
 
     msg = update.message
@@ -558,9 +550,7 @@ async def on_dashboard_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             filename = getattr(media, "file_name", None) or "fundo.png"
             file_obj = await media.get_file()
             content = bytes(await file_obj.download_as_bytearray())
-            result = await asyncio.to_thread(
-                vc.salvar_fundo, content, filename, str(update.effective_user.id)
-            )
+            result = vc.salvar_fundo(content, filename, str(update.effective_user.id))
             ctx.user_data.pop("dashboard_pending", None)
             await msg.reply_text(result.get("message") if result.get("ok") else f"Erro: {result.get('error')}")
             return
@@ -581,12 +571,11 @@ async def on_dashboard_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         ctx.user_data.pop("dashboard_pending", None)
         await msg.reply_text("Processando video...")
-        result = await asyncio.to_thread(
-            vc.processar_video,
+        result = vc.processar_video(
             content,
             filename,
             str(update.effective_user.id),
-            vs.get_config(update.effective_user.id),
+            _video_user_cfg.get(update.effective_user.id, {}),
         )
         if result.get("ok"):
             await msg.reply_video(video=result["video_bytes"], filename=result["filename"])
@@ -638,23 +627,6 @@ def _load_usuarios():
         logger.info(f"Usuarios carregados: {len(_ALLOWED_USERS)}")
     except Exception as e:
         logger.warning(f"Nao foi possivel carregar usuarios: {e}")
-
-
-def _user_role(user_id: int) -> str | None:
-    if user_id == TELEGRAM_OWNER_ID:
-        return "owner"
-    _load_usuarios()
-    info = _ALLOWED_USERS.get(user_id)
-    if not info:
-        return None
-    return "admin" if info.get("is_admin") else "user"
-
-
-def _video_only_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [_button("Editor de Video", "dash:video")],
-        [_button("Atualizar", "dash:video")],
-    ])
 
 
 def _save_usuario(user_id: int, data: dict):
@@ -817,37 +789,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         _load_usuarios()
         if user.id in _ALLOWED_USERS:
-            info = _ALLOWED_USERS[user.id]
-            if info.get("is_admin"):
-                await _show(update, _home_text(ctx), _main_keyboard())
-            else:
-                await _show(update, _video_home_text(), _video_only_keyboard())
-            return
-
-        if action == "video_editor":
-            ctx.user_data.pop("dashboard_pending", None)
-            await msg.reply_text("Criando o preview interativo...")
-            result = await asyncio.to_thread(
-                vc.criar_editor_session,
-                content,
-                filename,
-                str(update.effective_user.id),
-                vs.get_config(update.effective_user.id),
-            )
-            if not result.get("ok"):
-                await msg.reply_text(f"Erro ao abrir editor: {result.get('error', 'falha desconhecida')}")
-                return
-            ctx.user_data["video_editor_token"] = result["token"]
-            ctx.user_data["video_editor_source"] = (content, filename)
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Abrir editor", url=result["editor_url"])],
-                [_button("Aplicar e processar", "dash:video:editor_apply")],
-                [_button("Cancelar", "dash:video")],
-            ])
-            await msg.reply_text(
-                "Abra o editor, arraste/redimensione o video, toque em salvar e depois volte para aplicar.",
-                reply_markup=keyboard,
-            )
+            await _show(update, _home_text(ctx), _main_keyboard())
             return
     except Exception:
         pass
@@ -870,35 +812,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_dashboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
-        return
-    role = _user_role(update.effective_user.id)
-    pending = ctx.user_data.get("dashboard_pending", "")
-    if not role or (role == "user" and not pending.startswith("video_")):
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
         return
     await _handle_pending(update, ctx)
 
 
 async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not update.effective_user:
+    await query.answer()
+    if not update.effective_user or update.effective_user.id != TELEGRAM_OWNER_ID:
         return
     data = query.data or ""
-    role = _user_role(update.effective_user.id)
-    if not role:
-        await query.answer("Acesso negado.", show_alert=True)
-        return
-    if role == "user" and data in {"dash:home", "dash:refresh"}:
-        await query.answer()
-        await _show(update, _video_home_text(), _video_only_keyboard())
-        return
-    if role == "user" and not data.startswith("dash:video"):
-        await query.answer("Seu acesso e somente ao editor de video.", show_alert=True)
-        return
-    if data.startswith("dash:usuarios") and role != "owner":
-        await query.answer("Somente o proprietario gerencia usuarios.", show_alert=True)
-        return
-    await query.answer()
 
     try:
         if data in {"dash:home", "dash:refresh"}:
@@ -984,14 +908,11 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             accounts_db.update_settings(acc["username"], {"unfollow_policy": policy})
             await _show(update, "Regra de unfollow atualizada.\n\n" + _config_text(ctx), _config_keyboard())
         elif data == "dash:video":
-            ctx.user_data.pop("dashboard_pending", None)
-            ctx.user_data.pop("video_editor_token", None)
-            ctx.user_data.pop("video_editor_source", None)
             await _show(update, _video_home_text(), _video_keyboard())
         elif data == "dash:video:status":
-            await _show(update, await _video_status_text(), _video_keyboard())
+            await _show(update, _video_status_text(), _video_keyboard())
         elif data == "dash:video:get_fundo":
-            fundo = await asyncio.to_thread(vc.ver_fundo, str(update.effective_user.id))
+            fundo = vc.ver_fundo(str(update.effective_user.id))
             if fundo:
                 if update.callback_query:
                     await update.callback_query.message.reply_photo(
@@ -1006,49 +927,6 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif data == "dash:video:process":
             _prompt(ctx, "video_process")
             await _show(update, "Envie o video .mp4 para processar.", InlineKeyboardMarkup([[_button("Cancelar", "dash:video")]]))
-        elif data == "dash:video:editor":
-            _prompt(ctx, "video_editor")
-            await _show(
-                update,
-                "Envie o video .mp4. O bot vai abrir um preview que pode ser movido com mouse ou dedo.",
-                InlineKeyboardMarkup([[_button("Cancelar", "dash:video")]]),
-            )
-        elif data == "dash:video:editor_apply":
-            token = ctx.user_data.pop("video_editor_token", None)
-            source = ctx.user_data.pop("video_editor_source", None)
-            if not token or not source:
-                await _show(update, "A sessao do editor expirou. Abra o editor novamente.", _video_keyboard())
-                return
-            result = await asyncio.to_thread(vc.obter_editor_config, token)
-            if not result.get("ok"):
-                await _show(update, f"Nao foi possivel aplicar: {result.get('error')}", _video_keyboard())
-                return
-            editor_cfg = result.get("config") or {}
-            saved_cfg = vs.set_values(
-                update.effective_user.id,
-                {key: editor_cfg[key] for key in ("video_width", "position_x", "position_y") if key in editor_cfg},
-            )
-            if update.callback_query:
-                await update.callback_query.message.reply_text("Posicionamento salvo. Processando o video...")
-            content, filename = source
-            processed = await asyncio.to_thread(
-                vc.processar_video,
-                content,
-                filename,
-                str(update.effective_user.id),
-                saved_cfg,
-            )
-            if processed.get("ok") and update.callback_query:
-                await update.callback_query.message.reply_video(
-                    video=processed["video_bytes"],
-                    filename=processed["filename"],
-                    caption="Video processado com o posicionamento do editor.",
-                )
-            elif update.callback_query:
-                await update.callback_query.message.reply_text(
-                    f"Erro no processamento: {processed.get('error', 'falha desconhecida')}"
-                )
-            await _show(update, _video_home_text(), _video_keyboard())
         elif data == "dash:video:lote":
             ctx.user_data["video_lote"] = []
             _prompt(ctx, "video_lote")
@@ -1064,15 +942,10 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             if update.callback_query:
                 await update.callback_query.message.reply_text(f"⏳ Processando {len(lote)} video(s)...")
-            result = await asyncio.to_thread(
-                vc.processar_lote,
-                lote,
-                str(update.effective_user.id),
-                vs.get_config(update.effective_user.id),
-            )
+            result = vc.processar_lote(lote, str(update.effective_user.id), _video_user_cfg.get(update.effective_user.id, {}))
             for item in (result.get("resultados") or []):
                 if item.get("ok"):
-                    vbytes = await asyncio.to_thread(vc.download_lote_video, item["job_id"])
+                    vbytes = vc.download_lote_video(item["job_id"])
                     if vbytes and update.callback_query:
                         await update.callback_query.message.reply_video(
                             video=vbytes,
@@ -1084,7 +957,7 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _show(update, _video_home_text(), _video_keyboard())
         elif data == "dash:video:config":
             uid = update.effective_user.id
-            cfg = vs.get_config(uid)
+            cfg = _video_user_cfg.get(uid, {})
             cfg_text = (
                 "*Configuracoes do editor*\n\n"
                 f"Largura do video: *{cfg.get('video_width', 800)}px*\n"
@@ -1095,10 +968,10 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             await _show(update, cfg_text, _video_config_keyboard())
         elif data == "dash:video:config_reset":
-            vs.reset(update.effective_user.id)
+            _video_user_cfg.pop(update.effective_user.id, None)
             await _show(update, "Configuracoes resetadas para o padrao.", _video_keyboard())
         elif data == "dash:video:limpar":
-            result = await asyncio.to_thread(vc.limpar_tmp)
+            result = vc.limpar_tmp()
             msg = f"🗑 {result.get('removidos', 0)} arquivo(s) removido(s)." if result.get("ok") else f"Erro: {result.get('error')}"
             await _show(update, msg, _video_keyboard())
         elif data.startswith("dash:video:cfg:"):
@@ -1112,8 +985,8 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             }
             if action in ("antiban", "fix_mirror"):
                 uid = update.effective_user.id
-                cfg = vs.get_config(uid)
-                cfg = vs.set_values(uid, {action: not cfg[action]})
+                cfg = _video_user_cfg.setdefault(uid, {})
+                cfg[action] = not cfg.get(action, action != "antiban")
                 val = "ativo" if cfg[action] else "desativado"
                 await _show(update, f"*{action}* atualizado: *{val}*", _video_config_keyboard())
             elif action in prompts_video:
@@ -1168,14 +1041,11 @@ async def _handle_config_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 
 def register_dashboard_handlers(app):
-    # /start e callbacks usam o grupo principal. Texto livre fica no grupo 1
-    # para não engolir códigos de ConversationHandlers registrados no grupo 0.
+    # Tudo em group=0 (padrao) — registrado PRIMEIRO no main.py
+    # para ter prioridade sobre ConversationHandlers que vem depois
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_dashboard_button, pattern=r"^dash:"))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, on_dashboard_text),
-        group=1,
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_dashboard_text))
     app.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.Document.VIDEO,
