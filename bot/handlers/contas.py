@@ -106,9 +106,20 @@ async def cmd_conta_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return ConversationHandler.END
 
-    elif result == "error:bad_password":
+    elif result in ("error:bad_password", "error:credentials_rejected"):
         await update.message.reply_text(
-            f"❌ *Senha incorreta* para @{username}.",
+            f"❌ *O Instagram recusou o login de @{username}.*\n\n"
+            "Isso não confirma que a senha esteja errada. Pode ser uma "
+            "validação do dispositivo ou da sessão. Abra o Instagram, confirme "
+            "qualquer alerta de segurança e tente novamente uma vez.",
+            parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif result == "error:challenge_required":
+        await update.message.reply_text(
+            f"🔐 *O Instagram exigiu uma confirmação para @{username}.*\n\n"
+            "Abra o aplicativo oficial, aprove a tentativa de login e execute "
+            "`/conta_add` novamente.",
             parse_mode="Markdown")
         return ConversationHandler.END
 

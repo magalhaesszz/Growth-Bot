@@ -17,6 +17,7 @@ import instagram.client as client_module
 
 class FakeClient:
     login_result = "ok"
+    standard_login_result = False
 
     def __init__(self):
         self.uuids = {}
@@ -92,7 +93,9 @@ class FakeClient:
         return json.loads(Path(path).read_text(encoding="utf-8"))
 
     def login(self, username, password, verification_code=""):
-        return verification_code == "123456"
+        if verification_code:
+            return verification_code == "123456"
+        return self.standard_login_result
 
     def get_timeline_feed(self):
         return {}
@@ -107,6 +110,7 @@ class InstagramClientTests(unittest.TestCase):
         self.client_patch.start()
         client_module.PENDING_CHALLENGES.clear()
         FakeClient.login_result = "ok"
+        FakeClient.standard_login_result = False
 
     def tearDown(self):
         self.client_patch.stop()
@@ -142,6 +146,18 @@ class InstagramClientTests(unittest.TestCase):
         self.assertEqual(ig.login(), "two_factor")
         self.assertTrue(ig.submit_2fa("123456"))
         self.assertTrue(ig.session_path.exists())
+
+    def test_caa_password_text_retries_standard_login(self):
+        FakeClient.login_result = "incorrect password"
+        FakeClient.standard_login_result = True
+        ig = client_module.InstagramClient("conta", "senha")
+        self.assertEqual(ig.login(), "ok")
+        self.assertTrue(ig.session_path.exists())
+
+    def test_caa_password_text_is_not_reported_as_proven_bad_password(self):
+        FakeClient.login_result = "incorrect password"
+        ig = client_module.InstagramClient("conta", "senha")
+        self.assertEqual(ig.login(), "error:credentials_rejected")
 
     def test_invalid_code_is_rejected(self):
         FakeClient.login_result = "challenge"

@@ -187,7 +187,13 @@ class InstagramClient:
 
             text = self.cl._bloks_all_text(result).casefold()
             if "incorrect password" in text or "senha incorreta" in text:
-                return "error:bad_password"
+                # O CAA também usa "incorrect password" como recusa genérica
+                # do fluxo/dispositivo. Tente o login padrão antes de concluir.
+                logger.info(
+                    "[%s] CAA recusou a credencial; tentando fluxo padrao.",
+                    self.username,
+                )
+                return self._try_standard_login()
             logger.warning(
                 "[%s] CAA sem sessao e sem contexto 2FA (challenge=%s, checkpoint=%s).",
                 self.username,
@@ -199,7 +205,7 @@ class InstagramClient:
             self._register_pending("2fa", "authenticator")
             return "two_factor"
         except BadPassword:
-            return "error:bad_password"
+            return "error:credentials_rejected"
         except (PleaseWaitFewMinutes, RateLimitError):
             return "error:rate_limit"
         except FeedbackRequired:
@@ -213,6 +219,36 @@ class InstagramClient:
             if "429" in message or "too many" in message or "retry" in message:
                 return "error:rate_limit_429"
             logger.error("[%s] Erro CAA: %s", self.username, type(exc).__name__)
+            return f"error:{type(exc).__name__}"
+
+    def _try_standard_login(self) -> str:
+        """Tenta o fluxo padrão da biblioteca sem diagnosticar falsamente a senha."""
+        try:
+            if self.cl.login(self.username, self.password):
+                self._save_session()
+                self._reset_pending()
+                return "ok"
+            return "error:credentials_rejected"
+        except TwoFactorRequired:
+            self._register_pending("2fa", "authenticator")
+            return "two_factor"
+        except ChallengeRequired:
+            return "error:challenge_required"
+        except BadPassword:
+            return "error:credentials_rejected"
+        except (PleaseWaitFewMinutes, RateLimitError):
+            return "error:rate_limit"
+        except FeedbackRequired:
+            return "error:feedback_required"
+        except Exception as exc:
+            message = str(exc).lower()
+            if "407" in message or "proxy" in message:
+                return "error:proxy"
+            if "429" in message or "too many" in message:
+                return "error:rate_limit_429"
+            logger.warning(
+                "[%s] Fluxo padrao falhou: %s", self.username, type(exc).__name__
+            )
             return f"error:{type(exc).__name__}"
 
     def _prepare_caa_challenge(self, send_result: dict) -> bool:
