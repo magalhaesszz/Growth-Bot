@@ -27,8 +27,6 @@ CREATE TABLE IF NOT EXISTS ig_accounts (
     delay_max       INTEGER DEFAULT 90,
     score_min       INTEGER DEFAULT 50,
     unfollow_after_days INTEGER DEFAULT 5,
-    unfollow_policy TEXT DEFAULT 'keep_follow_backs',
-    daily_report_enabled BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ DEFAULT now(),
     last_active_at  TIMESTAMPTZ
 );
@@ -195,12 +193,6 @@ class AccountsDB:
     def update_status(self, username: str, status: str):
         self.sb.table("ig_accounts").update({"status": status}).eq("username", username).execute()
 
-    def update_auth(self, username: str, password: str, fingerprint: dict = None):
-        self.sb.table("ig_accounts").update({
-            "password_enc": _encrypt(password),
-            "fingerprint": fingerprint,
-        }).eq("username", username).execute()
-
     def update_last_active(self, username: str):
         self.sb.table("ig_accounts").update(
             {"last_active_at": datetime.utcnow().isoformat()}
@@ -209,43 +201,9 @@ class AccountsDB:
     def update_settings(self, username: str, settings: dict):
         allowed = {
             "daily_follows", "daily_unfollows", "hour_start", "hour_end",
-            "delay_min", "delay_max", "score_min", "unfollow_after_days",
-            "unfollow_policy", "daily_report_enabled",
+            "delay_min", "delay_max", "score_min", "unfollow_after_days"
         }
-        unknown = set(settings) - allowed
-        if unknown:
-            raise ValueError("Configurações desconhecidas: " + ", ".join(sorted(unknown)))
-        payload = dict(settings)
-        ranges = {
-            "daily_follows": (0, 1000),
-            "daily_unfollows": (0, 1000),
-            "hour_start": (0, 23),
-            "hour_end": (1, 24),
-            "delay_min": (0, 86400),
-            "delay_max": (0, 86400),
-            "score_min": (0, 100),
-            "unfollow_after_days": (0, 365),
-        }
-        for key, (minimum, maximum) in ranges.items():
-            if key in payload:
-                try:
-                    payload[key] = int(payload[key])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"{key} deve ser um número inteiro") from exc
-                if not minimum <= payload[key] <= maximum:
-                    raise ValueError(f"{key} deve estar entre {minimum} e {maximum}")
-        if {"hour_start", "hour_end"} <= payload.keys():
-            if payload["hour_start"] >= payload["hour_end"]:
-                raise ValueError("hour_start deve ser menor que hour_end")
-        if {"delay_min", "delay_max"} <= payload.keys():
-            if payload["delay_min"] > payload["delay_max"]:
-                raise ValueError("delay_min deve ser menor ou igual a delay_max")
-        if "unfollow_policy" in payload and payload["unfollow_policy"] not in {
-            "remove_all", "keep_follow_backs", "remove_only_follow_backs"
-        }:
-            raise ValueError("Regra de unfollow inválida")
-        if "daily_report_enabled" in payload:
-            payload["daily_report_enabled"] = bool(payload["daily_report_enabled"])
+        payload = {k: v for k, v in settings.items() if k in allowed}
         self.sb.table("ig_accounts").update(payload).eq("username", username).execute()
 
     def remove_account(self, username: str):
