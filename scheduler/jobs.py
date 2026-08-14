@@ -1,7 +1,5 @@
-import asyncio
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -15,18 +13,17 @@ from instagram.follower import Follower
 from instagram.unfollower import Unfollower
 from instagram.stories import StoriesViewer
 from instagram.score import ProfileScorer, BlacklistFilter, WhitelistFilter
-from instagram.risk_detector import get_risk_detector
+from instagram.risk_detector import RiskDetector
 from scheduler.warmup import advance_all_warmups, get_warmup_limit
 from scheduler.anomaly import check_all_anomalies
 
 logger = logging.getLogger(__name__)
 
 # Instância global compartilhada entre todos os jobs
-risk_detector = get_risk_detector()
+risk_detector = RiskDetector()
 
 # Referência ao app Telegram (injetada em setup_scheduler)
 _telegram_app = None
-_event_loop = None
 
 
 async def _notify(message: str):
@@ -49,7 +46,7 @@ def _get_daily_limit(account: dict) -> int:
     return account.get("daily_follows", 40)
 
 
-def _run_follow_job_sync():
+async def run_follow_job():
     accounts_db = AccountsDB()
     db = DB()
     accounts = accounts_db.list_active_accounts()
@@ -61,18 +58,14 @@ def _run_follow_job_sync():
             logger.warning(f"[{username}] Pausada — pulando follow job.")
             continue
 
-        now_hour = datetime.now(ZoneInfo("America/Sao_Paulo")).hour
+        now_hour = datetime.utcnow().hour
         if not (acc["hour_start"] <= now_hour < acc["hour_end"]):
             continue
 
         ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
         result = ig.login()
         if result != "ok":
-            if _event_loop:
-                asyncio.run_coroutine_threadsafe(
-                    _notify(f"❌ Falha de login — *@{username}*. Verifique as credenciais."),
-                    _event_loop,
-                )
+            await _notify(f"❌ Falha de login — *@{username}*. Verifique as credenciais.")
             continue
 
         targets = db.list_targets(acc["id"])
@@ -85,19 +78,13 @@ def _run_follow_job_sync():
         scorer = ProfileScorer()
         follower = Follower(ig, risk_detector, scorer, bl_filter)
 
-        daily_limit = max(0, _get_daily_limit(acc) - db.count_today_follows(acc["id"]))
-        if daily_limit == 0:
-            logger.info("[%s] Limite diário de follows já atingido.", username)
-            continue
+        daily_limit = _get_daily_limit(acc)
         campaign = db.get_active_campaign(acc["id"])
         campaign_id = campaign["id"] if campaign else None
 
         total_followed = 0
 
         for target in targets:
-            remaining = daily_limit - total_followed
-            if remaining <= 0:
-                break
             scraper = Scraper(ig)
 
             if not target.get("page_user_id"):
@@ -119,7 +106,6 @@ def _run_follow_job_sync():
 
             def on_follow(uname, uid, _campaign_id=campaign_id, _acc=acc):
                 db.add_followed(_acc["id"], uid, uname, _campaign_id)
-                already_following.add(str(uid))
                 db.log_action(_acc["id"], "follow", uname, success=True)
                 if _campaign_id:
                     db.update_campaign_stats(_campaign_id, follows=1)
@@ -152,11 +138,7 @@ def _run_follow_job_sync():
         logger.info(f"[{username}] Follow job finalizado — {total_followed} follows.")
 
 
-async def run_follow_job():
-    await asyncio.to_thread(_run_follow_job_sync)
-
-
-def _run_unfollow_job_sync():
+async def run_unfollow_job():
     accounts_db = AccountsDB()
     db = DB()
     accounts = accounts_db.list_active_accounts()
@@ -194,29 +176,16 @@ def _run_unfollow_job_sync():
                 if _campaign_id:
                     db.update_campaign_stats(_campaign_id, unfollows=1)
 
-        remaining = max(
-            0,
-            acc.get("daily_unfollows", 40)
-            - db.count_today_actions(acc["id"], "unfollow"),
-        )
-        if remaining == 0:
-            continue
-
         unfollower.unfollow_batch(
             candidates,
-            daily_limit=remaining,
+            daily_limit=acc.get("daily_unfollows", 40),
             delay_min=acc.get("delay_min", 30),
             delay_max=acc.get("delay_max", 90),
-            policy=acc.get("unfollow_policy", "keep_follow_backs"),
             on_success=on_unfollow,
         )
 
 
-async def run_unfollow_job():
-    await asyncio.to_thread(_run_unfollow_job_sync)
-
-
-def _run_session_backup_job_sync():
+async def run_session_backup_job():
     accounts_db = AccountsDB()
     for acc in accounts_db.list_active_accounts():
         ig = InstagramClient(acc["username"], acc["password"], acc.get("fingerprint"))
@@ -224,10 +193,6 @@ def _run_session_backup_job_sync():
         if data:
             accounts_db.save_session_backup(acc["username"], data)
     logger.info("Backup de sessões concluído.")
-
-
-async def run_session_backup_job():
-    await asyncio.to_thread(_run_session_backup_job_sync)
 
 
 async def run_warmup_job():
@@ -238,44 +203,9 @@ async def run_anomaly_check():
     await check_all_anomalies(risk_detector, notify_fn=_notify)
 
 
-def _build_reports_sync() -> list[tuple[str, object]]:
-    from reports.daily import ReportGenerator
-
-    generator = ReportGenerator()
-    reports = []
-    for acc in AccountsDB().list_active_accounts():
-        if not acc.get("daily_report_enabled", True):
-            continue
-        reports.append((
-            generator.generate_text(acc["id"], acc["username"]),
-            generator.generate_chart(acc["id"], acc["username"]),
-        ))
-    return reports
-
-
-async def run_daily_report_job():
-    if not _telegram_app:
-        return
-    try:
-        reports = await asyncio.to_thread(_build_reports_sync)
-        for report_text, chart in reports:
-            await _telegram_app.bot.send_message(
-                chat_id=TELEGRAM_OWNER_ID,
-                text=report_text,
-                parse_mode="Markdown",
-            )
-            await _telegram_app.bot.send_photo(
-                chat_id=TELEGRAM_OWNER_ID,
-                photo=chart,
-            )
-    except Exception as exc:
-        logger.error("Falha no relatório automático: %s", type(exc).__name__)
-
-
 def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
-    global _telegram_app, _event_loop
+    global _telegram_app
     _telegram_app = telegram_app
-    _event_loop = asyncio.get_running_loop()
 
     scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
 
@@ -293,8 +223,5 @@ def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
 
     # Detector de anomalias — a cada 30 minutos
     scheduler.add_job(run_anomaly_check, CronTrigger(minute="*/30"), id="anomaly_check")
-
-    # Relatório dos últimos 7 dias, enviado diariamente às 21h30.
-    scheduler.add_job(run_daily_report_job, CronTrigger(hour=21, minute=30), id="daily_report")
 
     return scheduler
