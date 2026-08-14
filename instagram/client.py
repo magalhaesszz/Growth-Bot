@@ -76,6 +76,7 @@ class InstagramClient:
         }
         self._caa_send_result: dict | None = None
         self._caa_submit_context: dict | None = None
+        self._two_step_context: str | None = None
         self._verification_mode: str | None = None
         self.cl = self._build_client()
 
@@ -124,6 +125,7 @@ class InstagramClient:
         PENDING_CHALLENGES.pop(self.username, None)
         self._caa_send_result = None
         self._caa_submit_context = None
+        self._two_step_context = None
         self._verification_mode = None
 
     def _register_pending(self, mode: str, choice: str = "email_ou_app") -> None:
@@ -176,6 +178,22 @@ class InstagramClient:
                     return "error:caa_challenge_prepare"
                 self._register_pending("caa")
                 return "challenge"
+
+            context = self.cl.bloks_extract_two_step_verification_context(result)
+            if context:
+                self._two_step_context = context
+                self._register_pending("2fa_bloks", "authenticator")
+                return "two_factor"
+
+            text = self.cl._bloks_all_text(result).casefold()
+            if "incorrect password" in text or "senha incorreta" in text:
+                return "error:bad_password"
+            logger.warning(
+                "[%s] CAA sem sessao e sem contexto 2FA (challenge=%s, checkpoint=%s).",
+                self.username,
+                "challenge" in text,
+                "checkpoint" in text,
+            )
             return "error:caa_failed"
         except TwoFactorRequired:
             self._register_pending("2fa", "authenticator")
@@ -257,6 +275,8 @@ class InstagramClient:
             return False
         if self._caa_submit_context:
             return self._submit_caa_code(clean)
+        if self._two_step_context:
+            return self._submit_bloks_two_factor(clean)
         try:
             if self.cl.login(self.username, self.password, verification_code=clean):
                 self._save_session()
@@ -265,6 +285,34 @@ class InstagramClient:
         except Exception as exc:
             logger.warning(
                 "[%s] Código 2FA rejeitado: %s", self.username, type(exc).__name__
+            )
+        return False
+
+    def _submit_bloks_two_factor(self, code: str) -> bool:
+        context = self._two_step_context
+        if not context:
+            return False
+        challenge = "backup_codes" if len(code) == 8 else "totp"
+        try:
+            self.cl.bloks_two_step_verification_entrypoint(context)
+            self.cl.bloks_two_step_verification_method_picker(context)
+            self.cl.bloks_two_step_verification_select_method(
+                context, selected_method=challenge
+            )
+            if challenge == "backup_codes":
+                self.cl.bloks_two_step_verification_enter_backup_code(context)
+            result = self.cl.bloks_two_step_verification_verify_code(
+                context, code, challenge=challenge
+            )
+            if self.cl.bloks_apply_login_response(result):
+                self._save_session()
+                self._reset_pending()
+                return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Codigo Bloks 2FA rejeitado: %s",
+                self.username,
+                type(exc).__name__,
             )
         return False
 
