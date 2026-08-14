@@ -76,11 +76,6 @@ def main():
     register_operacoes_handlers(app)
     register_video_handlers(app)
 
-    # /start também como fallback em group=1 para garantir que
-    # usuarios de fora não fiquem presos em ConversationHandlers
-    from telegram.ext import CommandHandler as CmdH
-    from bot.handlers.dashboard import cmd_start
-    app.add_handler(CmdH("start", cmd_start), group=1)
 
     logger.info("Bot rodando.")
     app.run_polling(drop_pending_updates=True)
