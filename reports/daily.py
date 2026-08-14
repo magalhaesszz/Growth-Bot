@@ -27,11 +27,9 @@ class ReportGenerator:
 
     def generate_text(self, account_id: str, username: str) -> str:
         logs = self._get_week_data(account_id)
-        follows = sum(1 for l in logs if l["action"] == "follow" and l["success"])
-        unfollows = sum(1 for l in logs if l["action"] == "unfollow" and l["success"])
-        follow_backs = sum(
-            1 for l in logs if l["action"] == "follow_back_detected" and l["success"]
-        )
+        follows = sum(1 for l in logs if l["action"] == "follow")
+        unfollows = sum(1 for l in logs if l["action"] == "unfollow")
+        follow_backs = sum(1 for l in logs if l["action"] == "follow_back_detected")
         errors = sum(1 for l in logs if not l["success"])
 
         conv_rate = f"{(follow_backs / follows * 100):.1f}%" if follows else "0%"
@@ -51,8 +49,8 @@ class ReportGenerator:
 
     def generate_chart(self, account_id: str, username: str) -> io.BytesIO:
         """Gera gráfico de barras dos últimos 7 dias. Retorna buffer PNG."""
-        since = datetime.utcnow() - timedelta(days=6)
-        days = [(since + timedelta(days=i)).date() for i in range(7)]
+        since = datetime.utcnow() - timedelta(days=7)
+        days = [(since + timedelta(days=i)).date() for i in range(8)]
         day_labels = [d.strftime("%d/%m") for d in days]
 
         logs = self._get_week_data(account_id)
@@ -63,11 +61,11 @@ class ReportGenerator:
             d_str = d.isoformat()
             follows_per_day.append(sum(
                 1 for l in logs
-                if l["action"] == "follow" and l["success"] and l["executed_at"][:10] == d_str
+                if l["action"] == "follow" and l["executed_at"][:10] == d_str
             ))
             unfollows_per_day.append(sum(
                 1 for l in logs
-                if l["action"] == "unfollow" and l["success"] and l["executed_at"][:10] == d_str
+                if l["action"] == "unfollow" and l["executed_at"][:10] == d_str
             ))
 
         fig, ax = plt.subplots(figsize=(8, 4))
