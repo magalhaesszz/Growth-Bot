@@ -2,18 +2,17 @@ import logging
 from telegram import Update
 from telegram.ext import Application
 
-from config import TELEGRAM_TOKEN, TELEGRAM_OWNER_ID
-from bot.handlers.contas import register_contas_handlers
-from bot.handlers.operacoes import register_operacoes_handlers
-from bot.handlers.video import register_video_handlers
-from bot.handlers.dashboard import register_dashboard_handlers
-from scheduler.jobs import setup_scheduler
+from config import TELEGRAM_TOKEN, TELEGRAM_OWNER_ID, validate_config
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# O logger HTTP pode incluir a URL completa da Bot API, que contém o token.
+# A biblioteca Telegram já encaminha falhas ao on_error sem expor essa URL.
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
 
 
 async def _restore_sessions():
@@ -31,11 +30,16 @@ async def _restore_sessions():
                 restored += 1
         if restored:
             logger.info(f"Sessões restauradas do Supabase: {restored} conta(s).")
-    except Exception as e:
-        logger.warning(f"Não foi possível restaurar sessões: {e}")
+    except Exception as exc:
+        logger.warning(
+            "Não foi possível restaurar sessões (%s).",
+            type(exc).__name__,
+        )
 
 
 async def post_init(app: Application):
+    from scheduler.jobs import setup_scheduler
+
     await _restore_sessions()
     scheduler = setup_scheduler(telegram_app=app)
     scheduler.start()
@@ -54,10 +58,16 @@ async def post_init(app: Application):
 
 
 async def on_error(update: object, context):
-    logger.error(f"Erro não tratado: {context.error}", exc_info=context.error)
+    logger.error("Erro não tratado (%s).", type(context.error).__name__)
 
 
 def main():
+    validate_config()
+    from bot.handlers.contas import register_contas_handlers
+    from bot.handlers.operacoes import register_operacoes_handlers
+    from bot.handlers.video import register_video_handlers
+    from bot.handlers.dashboard import register_dashboard_handlers
+
     logger.info("Iniciando Growth Bot...")
     app = (
         Application.builder()
@@ -67,8 +77,8 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    # Dashboard em group=-1 (prioridade máxima)
-    # /start e dash:callbacks respondem ANTES de qualquer ConversationHandler
+    # O dashboard registra /start e callbacks no grupo principal e deixa
+    # texto/mídia guiados no grupo 1 para não interceptar conversas.
     register_dashboard_handlers(app)
 
     # ConversationHandlers em group=0 (padrão)

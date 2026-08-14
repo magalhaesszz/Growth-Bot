@@ -1,9 +1,16 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from supabase import create_client
 from config import SUPABASE_URL, SUPABASE_KEY
 
 logger = logging.getLogger(__name__)
+
+
+def _local_day_start_utc() -> str:
+    local_now = datetime.now(ZoneInfo("America/Sao_Paulo"))
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_start.astimezone(timezone.utc).isoformat()
 
 
 class DB:
@@ -55,12 +62,26 @@ class DB:
         return {r["target_user_id"] for r in (res.data or [])}
 
     def count_today_follows(self, account_id) -> int:
-        today = datetime.utcnow().date().isoformat()
+        today = _local_day_start_utc()
         res = (
             self.sb.table("ig_followed")
             .select("id", count="exact")
             .eq("account_id", account_id)
             .gte("followed_at", today)
+            .execute()
+        )
+        return res.count or 0
+
+    def count_today_actions(self, account_id, action: str) -> int:
+        """Conta apenas ações bem-sucedidas registradas no dia atual."""
+        today = _local_day_start_utc()
+        res = (
+            self.sb.table("ig_action_logs")
+            .select("id", count="exact")
+            .eq("account_id", account_id)
+            .eq("action", action)
+            .eq("success", True)
+            .gte("executed_at", today)
             .execute()
         )
         return res.count or 0
@@ -190,7 +211,7 @@ class DB:
         return res.data or []
 
     def get_stats_today(self, account_id) -> dict:
-        today = datetime.utcnow().date().isoformat()
+        today = _local_day_start_utc()
         logs = (
             self.sb.table("ig_action_logs")
             .select("action, success")
@@ -199,11 +220,17 @@ class DB:
             .execute()
         ).data or []
 
-        stats = {"follow": 0, "unfollow": 0, "story_view": 0, "error": 0}
+        stats = {
+            "follow": 0,
+            "unfollow": 0,
+            "follow_back_detected": 0,
+            "story_view": 0,
+            "error": 0,
+        }
         for log in logs:
             action = log["action"]
-            if action in stats:
-                stats[action] += 1
-            elif not log["success"]:
+            if not log["success"]:
                 stats["error"] += 1
+            elif action in stats:
+                stats[action] += 1
         return stats

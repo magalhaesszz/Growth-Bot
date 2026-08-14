@@ -2,6 +2,7 @@ import logging
 from collections import deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from config import (
     RISK_ERROR_RATE_THRESHOLD,
@@ -95,7 +96,7 @@ class RiskDetector:
         """
         state = self._state(username)
         now = datetime.utcnow()
-        hour_now = now.hour
+        hour_now = datetime.now(ZoneInfo("America/Sao_Paulo")).hour
 
         if not (hour_start <= hour_now < hour_end):
             return False  # fora da janela de operação, ok
@@ -153,3 +154,11 @@ class RiskDetector:
 
     def get_all_statuses(self) -> list[dict]:
         return [self.get_status(u) for u in self._states]
+
+
+_SHARED_RISK_DETECTOR = RiskDetector()
+
+
+def get_risk_detector() -> RiskDetector:
+    """Retorna o detector compartilhado pelo painel e pelos jobs."""
+    return _SHARED_RISK_DETECTOR

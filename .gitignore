@@ -1,7 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
 sessions/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 .DS_Store
 *.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/

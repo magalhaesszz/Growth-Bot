@@ -54,6 +54,7 @@ class Unfollower:
         daily_limit: int,
         delay_min: int,
         delay_max: int,
+        policy: str = "keep_follow_backs",
         on_success=None,
     ) -> dict:
         results = {"unfollowed": 0, "kept": 0, "skipped": 0, "errors": 0}
@@ -62,18 +63,26 @@ class Unfollower:
             if not self._can_unfollow(daily_limit):
                 break
 
-            uname = entry.get("username", "")
-            uid = entry.get("user_id", "")
+            uname = entry.get("target_username") or entry.get("username", "")
+            uid = entry.get("target_user_id") or entry.get("user_id", "")
+            if not uname or not uid:
+                results["errors"] += 1
+                logger.error("Candidato de unfollow sem username ou user_id: %s", entry.get("id"))
+                continue
 
             if self.whitelist.is_protected(uname):
                 results["kept"] += 1
                 logger.debug(f"@{uname} na whitelist — mantendo.")
                 continue
 
-            follows_back = self._follows_back(uid)
-            if follows_back:
+            follows_back = self._follows_back(uid) if policy != "remove_all" else False
+            should_keep = (
+                (policy == "keep_follow_backs" and follows_back)
+                or (policy == "remove_only_follow_backs" and not follows_back)
+            )
+            if should_keep:
                 results["kept"] += 1
-                if on_success:
+                if follows_back and on_success:
                     on_success(uname, uid, True)
                 continue
 
