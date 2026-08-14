@@ -54,6 +54,11 @@ class InstagramClient:
         self._fingerprint = {"device": "Pixel 8 Pro (padrao instagrapi)"}
         # Criar Client UMA vez — não recriar, preserva estado CAA
         self.cl = Client()
+        # Configurar proxy se definido (necessário quando IP do servidor é bloqueado)
+        from config import INSTAGRAM_PROXY
+        if INSTAGRAM_PROXY:
+            self.cl.set_proxy(INSTAGRAM_PROXY)
+            logger.info(f'[{username}] Proxy configurado: {INSTAGRAM_PROXY.split("@")[-1]}')
         # Substituir challenge_code_handler — intercepta pedido de código
         self.cl.challenge_code_handler = self._telegram_code_handler
 
