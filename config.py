@@ -39,6 +39,10 @@ ANOMALY_ZERO_ACTION_HOURS = 2      # horas sem ação dentro da janela → alert
 QUEUE_MAX_RETRIES = 3
 QUEUE_BACKOFF_BASE = 60            # segundos base para backoff exponencial
 
+# ─── Proxy Instagram (opcional — usar se IP do servidor for bloqueado) ──
+# Formato: http://usuario:senha@host:porta  ou  socks5://host:porta
+INSTAGRAM_PROXY = os.getenv('INSTAGRAM_PROXY', '')  # vazio = sem proxy
+
 # ─── Pasta de sessões ────────────────────────────────────────
 # /tmp é gravável tanto no Discloud quanto localmente.
 # Backup criptografado das sessões fica no Supabase (persistente).
