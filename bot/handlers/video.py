@@ -1,5 +1,6 @@
-import asyncio
+import json
 import logging
+import os
 
 from telegram import Update
 from telegram.ext import (
@@ -9,7 +10,6 @@ from telegram.ext import (
 
 from config import TELEGRAM_OWNER_ID
 import video_client as vc
-import video_settings as vs
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 AGUARDANDO_FUNDO  = 10
 AGUARDANDO_VIDEO  = 11
 AGUARDANDO_LOTE   = 12
+
+# Config de vídeo por usuário (em memória — persiste enquanto bot rodar)
+_user_cfg: dict[int, dict] = {}
+
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -33,7 +37,7 @@ def _account_id(update: Update) -> str:
 
 
 def _cfg(update: Update) -> dict:
-    return vs.get_config(update.effective_user.id)
+    return _user_cfg.get(update.effective_user.id, {})
 
 
 # ─── /fundo ──────────────────────────────────────────────────
@@ -65,9 +69,7 @@ async def receber_fundo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text("⏳ Salvando fundo...")
 
-    result = await asyncio.to_thread(
-        vc.salvar_fundo, bytes(fundo_bytes), filename, _account_id(update)
-    )
+    result = vc.salvar_fundo(bytes(fundo_bytes), filename, _account_id(update))
     if result["ok"]:
         await msg.reply_text("✅ Fundo salvo com sucesso!\nAgora use /video para processar um vídeo.")
     else:
@@ -115,12 +117,11 @@ async def receber_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     file_obj    = await file_ref.get_file()
     video_bytes = await file_obj.download_as_bytearray()
 
-    result = await asyncio.to_thread(
-        vc.processar_video,
-        bytes(video_bytes),
-        filename,
-        _account_id(update),
-        _cfg(update),
+    result = vc.processar_video(
+        video_bytes=bytes(video_bytes),
+        filename=filename,
+        account_id=_account_id(update),
+        cfg=_cfg(update),
     )
 
     if result["ok"]:
@@ -200,9 +201,7 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"⏳ Processando {len(lote)} vídeo(s)...")
 
-    result = await asyncio.to_thread(
-        vc.processar_lote, lote, _account_id(update), _cfg(update)
-    )
+    result = vc.processar_lote(lote, _account_id(update), _cfg(update))
 
     if not result.get("resultados"):
         await update.message.reply_text(f"❌ Erro: {result.get('error')}")
@@ -210,7 +209,7 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     for item in result["resultados"]:
         if item["ok"]:
-            video_bytes = await asyncio.to_thread(vc.download_lote_video, item["job_id"])
+            video_bytes = vc.download_lote_video(item["job_id"])
             if video_bytes:
                 await update.message.reply_video(
                     video=video_bytes,
@@ -232,7 +231,7 @@ async def executar_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Consultando API...")
-    status = await asyncio.to_thread(vc.api_status)
+    status = vc.api_status()
     if status.get("ok"):
         await update.message.reply_text(
             f"📡 *Status da Video API*\n\n"
@@ -253,20 +252,19 @@ async def cmd_video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    cfg = vs.get_config(uid)
+    cfg = _user_cfg.get(uid, {})
 
     if not ctx.args:
-        atual = cfg
+        defaults = vc.config_default()
+        atual = {**defaults, **cfg}
         linhas = [
             "⚙️ *Configurações do editor de vídeo:*\n",
             f"  Largura do vídeo: `{atual.get('video_width', 800)}px`",
-            f"  Posição horizontal: `{atual.get('position_x', 0.5)}`",
-            f"  Posição vertical: `{atual.get('position_y', 0.25)}`",
+            f"  Posição vertical: `{atual.get('position_y', 0.25)} (0=topo, 1=base)`",
             f"  Qualidade (CRF): `{atual.get('output_crf', 18)}` (18=alta, 28=baixa)",
             f"  Anti-ban: `{'ativado' if atual.get('antiban', True) else 'desativado'}`",
             f"  Fix mirror: `{'sim' if atual.get('fix_mirror', False) else 'não'}`",
             f"  FPS: `{atual.get('output_fps', 30)}`",
-            f"  Recorte automático de bordas: `{'sim' if atual.get('auto_crop_borders', True) else 'não'}`",
             f"\nUso: /config_video chave=valor",
             f"Exemplos:",
             f"`/config_video video_width=900`",
@@ -278,7 +276,7 @@ async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(linhas), parse_mode="Markdown")
         return
 
-    values = {}
+    # Aplicar configuração
     for arg in ctx.args:
         if "=" not in arg:
             continue
@@ -286,12 +284,17 @@ async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         k = k.strip()
         v = v.strip()
 
-        values[k] = v
-    try:
-        cfg = vs.set_values(uid, values)
-    except ValueError as exc:
-        await update.message.reply_text(f"❌ {exc}")
-        return
+        # Conversão de tipos
+        if v.lower() in ("true", "false"):
+            cfg[k] = v.lower() == "true"
+        elif "." in v:
+            try: cfg[k] = float(v)
+            except: cfg[k] = v
+        else:
+            try: cfg[k] = int(v)
+            except: cfg[k] = v
+
+    _user_cfg[uid] = cfg
     await update.message.reply_text(
         f"✅ Configuração atualizada:\n" +
         "\n".join(f"  `{k}` = `{v}`" for k, v in cfg.items()),
@@ -303,7 +306,7 @@ async def cmd_config_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_config_video_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    vs.reset(update.effective_user.id)
+    _user_cfg.pop(update.effective_user.id, None)
     await update.message.reply_text("✅ Configurações de vídeo resetadas para o padrão.")
 
 
@@ -311,7 +314,7 @@ async def cmd_config_video_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def cmd_video_limpar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    result = await asyncio.to_thread(vc.limpar_tmp)
+    result = vc.limpar_tmp()
     if result.get("ok"):
         await update.message.reply_text(f"🗑 {result.get('removidos', 0)} arquivo(s) removido(s) do servidor.")
     else:
