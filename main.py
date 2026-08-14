@@ -40,17 +40,6 @@ async def post_init(app: Application):
     scheduler = setup_scheduler(telegram_app=app)
     scheduler.start()
     logger.info("Agendador iniciado.")
-    try:
-        await app.bot.send_message(
-            chat_id=TELEGRAM_OWNER_ID,
-            text=(
-                "✅ *Growth Bot online!*\n"
-                "Use /start para abrir o painel de controle."
-            ),
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
 
 
 async def on_error(update: object, context):
