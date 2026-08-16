@@ -257,6 +257,29 @@ class InstagramClient:
         if len(clean) <= 30 or not re.match(r"^\d+", clean):
             return "error:invalid_sessionid"
         try:
+            # Criar client temporário SEM proxy para importar sessionid
+            # O proxy causa TooManyRedirects na autenticação por cookie
+            temp_cl = Client()
+            temp_cl.set_uuids({
+                "phone_id": self._stable_uuid("phone_id"),
+                "uuid": self._stable_uuid("uuid"),
+                "client_session_id": self._stable_uuid("client_session_id"),
+                "advertising_id": self._stable_uuid("advertising_id"),
+                "android_device_id": "android-" + self._stable_bytes("android_device_id").hex()[:16],
+                "request_id": self._stable_uuid("request_id"),
+                "tray_session_id": self._stable_uuid("tray_session_id"),
+            })
+            if not temp_cl.login_by_sessionid(clean):
+                return "error:session_rejected"
+            # Copiar sessão validada para o client principal
+            import tempfile, os
+            tmp = tempfile.mktemp(suffix=".json")
+            temp_cl.dump_settings(tmp)
+            self.cl.load_settings(tmp)
+            try: os.remove(tmp)
+            except: pass
+            self._apply_network_identity(self.cl)
+            # Verificar que a sessão funciona com o client principal
             if not self.cl.login_by_sessionid(clean):
                 return "error:session_rejected"
             authenticated_username = str(getattr(self.cl, "username", "")).lstrip("@")
