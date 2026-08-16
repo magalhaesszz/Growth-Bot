@@ -254,6 +254,47 @@ async def run_anomaly_check():
     await check_all_anomalies(risk_detector, notify_fn=_notify)
 
 
+
+async def run_manual_mode():
+    """Roda follow job continuamente até _MANUAL_MODE = False."""
+    global _MANUAL_MODE
+    logger.info("Modo manual iniciado.")
+    while _MANUAL_MODE:
+        await run_follow_job()
+        if _MANUAL_MODE:
+            import asyncio
+            await asyncio.sleep(10)  # pausa minima entre ciclos
+    logger.info("Modo manual encerrado.")
+
+
+async def start_manual_mode(telegram_app=None) -> bool:
+    """Liga o modo manual. Retorna False se já estiver rodando."""
+    global _MANUAL_MODE, _MANUAL_TASK, _telegram_app
+    if _MANUAL_MODE:
+        return False
+    if telegram_app:
+        _telegram_app = telegram_app
+    _MANUAL_MODE = True
+    import asyncio
+    _MANUAL_TASK = asyncio.create_task(run_manual_mode())
+    return True
+
+
+async def stop_manual_mode() -> bool:
+    """Desliga o modo manual. Retorna False se não estiver rodando."""
+    global _MANUAL_MODE, _MANUAL_TASK
+    if not _MANUAL_MODE:
+        return False
+    _MANUAL_MODE = False
+    if _MANUAL_TASK and not _MANUAL_TASK.done():
+        _MANUAL_TASK.cancel()
+    _MANUAL_TASK = None
+    return True
+
+
+def is_manual_mode() -> bool:
+    return _MANUAL_MODE
+
 def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
     global _telegram_app
     _telegram_app = telegram_app
