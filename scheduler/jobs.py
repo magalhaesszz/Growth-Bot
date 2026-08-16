@@ -48,7 +48,7 @@ def _get_daily_limit(account: dict) -> int:
 LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
-def _run_follow_job_sync() -> list[str]:
+def _run_follow_job_sync(ignore_schedule: bool = False) -> list[str]:
     notifications: list[str] = []
     accounts_db = AccountsDB()
     db = DB()
@@ -61,17 +61,24 @@ def _run_follow_job_sync() -> list[str]:
             logger.warning(f"[{username}] Pausada — pulando follow job.")
             continue
 
-        now_hour = datetime.now(LOCAL_TZ).hour
-        if not (acc["hour_start"] <= now_hour < acc["hour_end"]):
-            continue
+        if not ignore_schedule:
+            now_hour = datetime.now(LOCAL_TZ).hour
+            if not (acc["hour_start"] <= now_hour < acc["hour_end"]):
+                continue
 
-        ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
-        result = ig.login()
-        if result != "ok":
-            notifications.append(
-                f"❌ Falha de login — *@{username}* (`{result}`)."
-            )
-            continue
+        ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
+        # Restaurar sessão salva — evita login com senha vazia
+        from database.accounts import AccountsDB as _ADB
+        _sess = _ADB().load_session_backup(username)
+        if _sess:
+            ig.load_session_from_data(_sess)
+        elif not ig.is_logged_in():
+            result = ig.login()
+            if result != "ok":
+                notifications.append(
+                    f"❌ Falha de login — *@{username}* (`{result}`)."
+                )
+                continue
 
         targets = db.list_targets(acc["id"])
         if not targets:
@@ -86,9 +93,12 @@ def _run_follow_job_sync() -> list[str]:
         configured_limit = _get_daily_limit(acc)
         already_today = db.count_today_follows(acc["id"])
         daily_limit = max(0, configured_limit - already_today)
-        if daily_limit <= 0:
+        if daily_limit <= 0 and not ignore_schedule:
             logger.info("[%s] Limite diário total já atingido.", username)
             continue
+        elif daily_limit <= 0 and ignore_schedule:
+            # Modo manual: reseta o limite parcial para continuar
+            daily_limit = configured_limit
         campaign = db.get_active_campaign(acc["id"])
         campaign_id = campaign["id"] if campaign else None
 
@@ -154,8 +164,8 @@ def _run_follow_job_sync() -> list[str]:
     return notifications
 
 
-async def run_follow_job():
-    notifications = await asyncio.to_thread(_run_follow_job_sync)
+async def run_follow_job(ignore_schedule: bool = False):
+    notifications = await asyncio.to_thread(_run_follow_job_sync, ignore_schedule)
     for message in notifications:
         await _notify(message)
 
@@ -264,7 +274,7 @@ async def run_manual_mode():
     global _MANUAL_MODE
     logger.info("Modo manual iniciado.")
     while _MANUAL_MODE:
-        await run_follow_job()
+        await run_follow_job(ignore_schedule=True)
         if _MANUAL_MODE:
             import asyncio
             await asyncio.sleep(10)  # pausa minima entre ciclos
