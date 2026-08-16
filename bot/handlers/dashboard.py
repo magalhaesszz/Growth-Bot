@@ -52,6 +52,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [_button("Fila", "dash:queue"), _button("Logs", "dash:logs")],
         [_button("Relatorio", "dash:report"), _button("Seguranca", "dash:safety")],
         [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
+        [_button("Rodar agora", "dash:manual_start"), _button("Parar", "dash:manual_stop")],
         [_button("Editor de Video", "dash:video")],
         [_button("Usuarios", "dash:usuarios")],
         [_button("Configuracoes", "dash:config_conta")],
