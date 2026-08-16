@@ -49,14 +49,21 @@ async def cmd_alvo_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     from instagram.client import InstagramClient
     from instagram.scraper import Scraper
-    ig = InstagramClient(acc["username"], acc["password"])
-    result_login = ig.login()
-    if result_login != "ok":
-        await update.message.reply_text(
-            f"❌ Não foi possível autenticar @{acc['username']}: `{result_login}`",
-            parse_mode="Markdown",
-        )
-        return
+    from database.accounts import AccountsDB
+    ig = InstagramClient(acc["username"], acc.get("password", ""))
+    # Restaurar sessão salva — não fazer login do zero
+    adb = AccountsDB()
+    session_data = adb.load_session_backup(acc["username"])
+    if session_data:
+        ig.load_session_from_data(session_data)
+    elif not ig.is_logged_in():
+        result_login = ig.login()
+        if result_login != "ok":
+            await update.message.reply_text(
+                f"❌ Não foi possível autenticar @{acc['username']}: `{result_login}`",
+                parse_mode="Markdown",
+            )
+            return
     page = Scraper(ig).resolve_page(url)
     if not page:
         await update.message.reply_text("❌ Página não encontrada no Instagram.")
