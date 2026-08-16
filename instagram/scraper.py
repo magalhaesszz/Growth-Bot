@@ -50,13 +50,25 @@ class Scraper:
 
         try:
             logger.info(f"[{self.username}] Raspando seguidores de @{page_username} (limite: {limit})")
-            raw = self.cl.user_followers(page_user_id, amount=limit)
 
-            for uid, user in raw.items():
-                if str(uid) in already_following:
+            # Tentar user_followers_v1 (Mobile API) — funciona com sessão web
+            users = []
+            try:
+                users = self.cl.user_followers_v1(page_user_id, amount=limit)
+            except Exception as e1:
+                logger.warning(f"[{self.username}] user_followers_v1 falhou: {e1} — tentando user_followers")
+                try:
+                    raw = self.cl.user_followers(page_user_id, amount=limit)
+                    users = list(raw.values())
+                except Exception as e2:
+                    logger.error(f"[{self.username}] user_followers também falhou: {e2}")
+
+            for user in users:
+                uid = str(user.pk)
+                if uid in already_following:
                     continue
                 followers.append({
-                    "user_id": str(uid),
+                    "user_id": uid,
                     "username": user.username,
                     "full_name": user.full_name,
                     "is_private": user.is_private,
@@ -65,7 +77,6 @@ class Scraper:
                     "media_count": user.media_count,
                     "profile_pic_url": str(user.profile_pic_url) if user.profile_pic_url else None,
                 })
-                # delay humano entre requisições de perfil
                 time.sleep(random.uniform(0.5, 1.5))
 
             logger.info(f"[{self.username}] {len(followers)} perfis raspados de @{page_username}")
