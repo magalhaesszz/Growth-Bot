@@ -54,6 +54,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
         [_button("Editor de Video", "dash:video")],
         [_button("Usuarios", "dash:usuarios")],
+        [_button("Configuracoes", "dash:config_conta")],
         [_button("Atualizar", "dash:home")],
     ])
 
@@ -490,6 +491,8 @@ async def _handle_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             start, end = _parse_range(text)
             accounts_db.update_settings(acc["username"], {"hour_start": start, "hour_end": end})
             await update.message.reply_text(f"Horario atualizado: {start}h-{end}h.")
+        elif action == "cfg_conta_valor":
+            await _handle_cfg_conta_pending(update, ctx, text)
         elif action in ("usuarios_add", "usuarios_remove"):
             await _handle_usuarios_pending(update, ctx, action, text)
         elif action == "video_fundo":
@@ -813,6 +816,103 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
             await msg.reply_text(f"ID `{uid}` nao encontrado.", parse_mode="Markdown")
     ctx.user_data.pop("dashboard_pending", None)
 
+
+def _config_conta_keyboard(acc: dict) -> InlineKeyboardMarkup:
+    h0 = acc.get("hour_start", 8)
+    h1 = acc.get("hour_end", 22)
+    fol = acc.get("daily_follows", 80)
+    unf = acc.get("daily_unfollows", 40)
+    dmi = acc.get("delay_min", 30)
+    dma = acc.get("delay_max", 90)
+    pra = acc.get("unfollow_after_days", 5)
+    sco = acc.get("score_min", 50)
+    return InlineKeyboardMarkup([
+        [_button(f"Hora inicio: {h0}h",    "dash:cfg_conta:hour_start"),
+         _button(f"Hora fim: {h1}h",       "dash:cfg_conta:hour_end")],
+        [_button(f"Follows/dia: {fol}",    "dash:cfg_conta:follows"),
+         _button(f"Unfollows/dia: {unf}",  "dash:cfg_conta:unfollows")],
+        [_button(f"Delay min: {dmi}s",     "dash:cfg_conta:delay_min"),
+         _button(f"Delay max: {dma}s",     "dash:cfg_conta:delay_max")],
+        [_button(f"Prazo unfollow: {pra}d","dash:cfg_conta:prazo"),
+         _button(f"Score minimo: {sco}",   "dash:cfg_conta:score")],
+        [_button("Voltar", "dash:home")],
+    ])
+
+
+CFG_LABELS = {
+    "dash:cfg_conta:hour_start":  ("hour_start",          "Hora de INICIO (0-23). Ex: 8"),
+    "dash:cfg_conta:hour_end":    ("hour_end",            "Hora de FIM (0-23). Ex: 22"),
+    "dash:cfg_conta:follows":     ("daily_follows",       "Follows por dia (1-200). Ex: 80"),
+    "dash:cfg_conta:unfollows":   ("daily_unfollows",     "Unfollows por dia (1-200). Ex: 40"),
+    "dash:cfg_conta:delay_min":   ("delay_min",           "Delay minimo em segundos (5-300). Ex: 30"),
+    "dash:cfg_conta:delay_max":   ("delay_max",           "Delay maximo em segundos (5-300). Ex: 90"),
+    "dash:cfg_conta:prazo":       ("unfollow_after_days", "Dias para checar follow back (1-30). Ex: 5"),
+    "dash:cfg_conta:score":       ("score_min",           "Score minimo de perfil (0-100). Ex: 50"),
+}
+
+CFG_LIMITS = {
+    "hour_start": (0, 23), "hour_end": (0, 23),
+    "daily_follows": (1, 200), "daily_unfollows": (1, 200),
+    "delay_min": (5, 300), "delay_max": (5, 300),
+    "unfollow_after_days": (1, 30), "score_min": (0, 100),
+}
+
+CFG_FIELD_LABELS = {
+    "hour_start": "Hora inicio", "hour_end": "Hora fim",
+    "daily_follows": "Follows/dia", "daily_unfollows": "Unfollows/dia",
+    "delay_min": "Delay minimo", "delay_max": "Delay maximo",
+    "unfollow_after_days": "Prazo unfollow", "score_min": "Score minimo",
+}
+
+
+async def _handle_config_conta(update, ctx, data: str):
+    from database.accounts import AccountsDB
+    adb = AccountsDB()
+    accounts = adb.list_active_accounts()
+    if not accounts:
+        await _show(update, "Nenhuma conta ativa.", _back_keyboard())
+        return
+    acc = accounts[0]
+    if data == "dash:config_conta":
+        texto = f"*Configuracoes de @{acc['username']}*\n\nToque em qualquer valor para editar:"
+        await _show(update, texto, _config_conta_keyboard(acc))
+        return
+    if data in CFG_LABELS:
+        field, msg = CFG_LABELS[data]
+        ctx.user_data["cfg_conta_field"] = field
+        ctx.user_data["cfg_conta_username"] = acc["username"]
+        _prompt(ctx, "cfg_conta_valor")
+        await _show(update, f"*{msg}*", InlineKeyboardMarkup([[_button("Cancelar", "dash:config_conta")]]))
+
+
+async def _handle_cfg_conta_pending(update, ctx, text: str):
+    from database.accounts import AccountsDB
+    field    = ctx.user_data.pop("cfg_conta_field", None)
+    username = ctx.user_data.pop("cfg_conta_username", None)
+    msg = update.message
+    if not field or not username:
+        await msg.reply_text("Sessao expirada. Abra /start novamente.")
+        return
+    try:
+        value = int(text.strip())
+    except ValueError:
+        await msg.reply_text("Digite apenas um numero inteiro.")
+        return
+    if field in CFG_LIMITS:
+        lo, hi = CFG_LIMITS[field]
+        if not (lo <= value <= hi):
+            await msg.reply_text(f"Valor deve ser entre {lo} e {hi}.")
+            return
+    try:
+        AccountsDB().update_settings(username, {field: value})
+        await msg.reply_text(
+            f"*{CFG_FIELD_LABELS.get(field, field)}* atualizado para *{value}*!",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await msg.reply_text(f"Erro ao salvar: {e}")
+    ctx.user_data.pop("dashboard_pending", None)
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1081,6 +1181,8 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pkey, pmsg = prompts_video[action]
                 _prompt(ctx, pkey)
                 await _show(update, pmsg, InlineKeyboardMarkup([[_button("Cancelar", "dash:video:config")]]))
+        elif data.startswith("dash:config_conta") or data.startswith("dash:cfg_conta:"):
+            await _handle_config_conta(update, ctx, data)
         elif data.startswith("dash:usuarios"):
             if update.effective_user.id != TELEGRAM_OWNER_ID:
                 await query.answer("Somente o proprietário gerencia usuários.", show_alert=True)
