@@ -255,6 +255,10 @@ async def run_anomaly_check():
 
 
 
+# Modo manual
+_MANUAL_MODE: bool = False
+_MANUAL_TASK = None
+
 async def run_manual_mode():
     """Roda follow job continuamente até _MANUAL_MODE = False."""
     global _MANUAL_MODE
