@@ -1181,6 +1181,23 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pkey, pmsg = prompts_video[action]
                 _prompt(ctx, pkey)
                 await _show(update, pmsg, InlineKeyboardMarkup([[_button("Cancelar", "dash:video:config")]]))
+        elif data == "dash:manual_start":
+            from scheduler.jobs import start_manual_mode, is_manual_mode
+            if is_manual_mode():
+                await _show(update, "Bot ja esta rodando em modo manual.\nClique em *Parar* para encerrar.", _main_keyboard())
+            else:
+                await start_manual_mode()
+                await _show(update,
+                    "Modo manual iniciado! O bot vai seguir pessoas continuamente.\n"
+                    "Clique em *Parar* quando quiser encerrar.",
+                    _main_keyboard())
+        elif data == "dash:manual_stop":
+            from scheduler.jobs import stop_manual_mode, is_manual_mode
+            if not is_manual_mode():
+                await _show(update, "O bot nao esta em modo manual.", _main_keyboard())
+            else:
+                await stop_manual_mode()
+                await _show(update, "Modo manual encerrado!", _main_keyboard())
         elif data.startswith("dash:config_conta") or data.startswith("dash:cfg_conta:"):
             await _handle_config_conta(update, ctx, data)
         elif data.startswith("dash:usuarios"):
