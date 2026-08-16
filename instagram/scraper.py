@@ -67,15 +67,16 @@ class Scraper:
                 uid = str(user.pk)
                 if uid in already_following:
                     continue
+                # UserShort nao tem follower_count — usar getattr com default
                 followers.append({
                     "user_id": uid,
                     "username": user.username,
-                    "full_name": user.full_name,
-                    "is_private": user.is_private,
-                    "follower_count": user.follower_count,
-                    "following_count": user.following_count,
-                    "media_count": user.media_count,
-                    "profile_pic_url": str(user.profile_pic_url) if user.profile_pic_url else None,
+                    "full_name": getattr(user, "full_name", ""),
+                    "is_private": getattr(user, "is_private", False),
+                    "follower_count": getattr(user, "follower_count", 0),
+                    "following_count": getattr(user, "following_count", 0),
+                    "media_count": getattr(user, "media_count", 0),
+                    "profile_pic_url": str(user.profile_pic_url) if getattr(user, "profile_pic_url", None) else None,
                 })
                 time.sleep(random.uniform(0.5, 1.5))
 
