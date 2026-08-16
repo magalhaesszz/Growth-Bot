@@ -261,7 +261,7 @@ def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
 
     # Follow — a cada 2h dentro da janela operacional
-    scheduler.add_job(run_follow_job, CronTrigger(hour="8,10,12,14,16,18,20"), id="follow_job")
+    scheduler.add_job(run_follow_job, CronTrigger(minute="*/40"), id="follow_job")
 
     # Unfollow — 1x por dia às 9h30
     scheduler.add_job(run_unfollow_job, CronTrigger(hour=9, minute=30), id="unfollow_job")
