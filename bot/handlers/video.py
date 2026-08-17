@@ -27,7 +27,9 @@ AGUARDANDO_FUNDO_DL  = 19
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != TELEGRAM_OWNER_ID:
+        from bot.access import has_access
+        uid = update.effective_user.id if update.effective_user else 0
+        if not has_access(uid):
             if update.message:
                 await update.message.reply_text("⛔ Acesso negado.")
             return ConversationHandler.END
