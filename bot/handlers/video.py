@@ -389,20 +389,29 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AGUARDANDO_LINK
 
     if action.startswith("editor_apply:"):
-        token  = action.split(":", 1)[1]
+        # token pode conter ":" — pegar tudo após o primeiro "editor_apply:"
+        raw_data = query.data  # ex: "dl:editor_apply:abc123"
+        token  = raw_data.replace("dl:editor_apply:", "", 1)
         stored = ctx.user_data.get("dl_editor_token")
         source = ctx.user_data.get("dl_editor_source")
-        if not source or token != stored:
-            await query.edit_message_text("\u274c Sessao expirada. Use Editor visual novamente.")
-            return AGUARDANDO_LINK
+        if not source:
+            # Sessao expirou — tentar recuperar do banco
+            await query.answer("Processando...", show_alert=False)
+            await query.message.reply_text(
+                "\u274c Sessao do editor expirada.\n"
+                "Use /download novamente, abra o editor e clique em Aplicar logo apos salvar.")
+            return ConversationHandler.END
         editor = await asyncio.to_thread(vc.obter_editor_result, token)
         if not editor.get("ok"):
-            await query.edit_message_text(f"\u274c Editor expirado: {editor.get('error')}")
-            return AGUARDANDO_LINK
-        editable = {k: v for k, v in editor["config"].items() if k in video_settings.DEFAULTS}
-        config   = video_settings.set_values(_uid(update), editable)
+            await query.message.reply_text(
+                f"\u274c Editor expirado ou token invalido.\n"
+                f"Use /download novamente e abra o editor.")
+            return ConversationHandler.END
+        editable = {k: v for k, v in editor.get("config", {}).items()
+                    if k in video_settings.DEFAULTS}
+        config = video_settings.set_values(_uid(update), editable)
         vid_bytes, fname = source
-        await query.message.reply_text("\u23f3 Aplicando layout e processando...")
+        await query.edit_message_text("\u23f3 Aplicando layout e processando...")
         result = await asyncio.to_thread(
             vc.processar_video, vid_bytes, fname, str(_uid(update)), config)
         if result.get("ok"):
@@ -411,7 +420,8 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 filename=result["filename"],
                 caption=f"\u2705 Pronto! {result['size_mb']} MB")
         else:
-            await query.message.reply_text(f"\u274c Erro: {result.get('error')}")
+            await query.message.reply_text(
+                f"\u274c Erro ao processar: {result.get('error')}")
         ctx.user_data.clear()
         return ConversationHandler.END
 
