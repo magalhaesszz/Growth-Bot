@@ -355,6 +355,66 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.clear()
         return ConversationHandler.END
 
+    if action == "editor":
+        vid_bytes = ctx.user_data.get("dl_video_bytes")
+        sp        = ctx.user_data.get("dl_storage_path")
+        fname     = ctx.user_data.get("dl_filename", "video.mp4")
+        if not vid_bytes and sp:
+            vid_bytes = await asyncio.to_thread(vdb.download_video, sp)
+        if not vid_bytes:
+            await query.edit_message_text("\u274c Nenhum video disponivel. Use /download novamente.")
+            return ConversationHandler.END
+        await query.edit_message_text("\u23f3 Abrindo editor visual...")
+        result = await asyncio.to_thread(
+            vc.criar_editor_session, vid_bytes, fname,
+            str(_uid(update)), video_settings.get_config(_uid(update))
+        )
+        if not result.get("ok"):
+            await query.message.reply_text(f"\u274c Erro: {result.get('error')}")
+            return AGUARDANDO_LINK
+        token = result["token"]
+        ctx.user_data["dl_editor_token"]  = token
+        ctx.user_data["dl_editor_source"] = (vid_bytes, fname)
+        await query.message.reply_text(
+            "\U0001f5bc\ufe0f *Editor visual aberto!*\n\n"
+            "Arraste o video para posicionar no fundo.\n"
+            "Quando terminar clique em *Aplicar*:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f590\ufe0f Abrir editor", url=result["editor_url"])],
+                [InlineKeyboardButton("\u2705 Aplicar e processar", callback_data=f"dl:editor_apply:{token}")],
+                [InlineKeyboardButton("\u274c Cancelar", callback_data="dl:cancelar")],
+            ]),
+            parse_mode="Markdown"
+        )
+        return AGUARDANDO_LINK
+
+    if action.startswith("editor_apply:"):
+        token  = action.split(":", 1)[1]
+        stored = ctx.user_data.get("dl_editor_token")
+        source = ctx.user_data.get("dl_editor_source")
+        if not source or token != stored:
+            await query.edit_message_text("\u274c Sessao expirada. Use Editor visual novamente.")
+            return AGUARDANDO_LINK
+        editor = await asyncio.to_thread(vc.obter_editor_result, token)
+        if not editor.get("ok"):
+            await query.edit_message_text(f"\u274c Editor expirado: {editor.get('error')}")
+            return AGUARDANDO_LINK
+        editable = {k: v for k, v in editor["config"].items() if k in video_settings.DEFAULTS}
+        config   = video_settings.set_values(_uid(update), editable)
+        vid_bytes, fname = source
+        await query.message.reply_text("\u23f3 Aplicando layout e processando...")
+        result = await asyncio.to_thread(
+            vc.processar_video, vid_bytes, fname, str(_uid(update)), config)
+        if result.get("ok"):
+            await query.message.reply_video(
+                video=result["video_bytes"],
+                filename=result["filename"],
+                caption=f"\u2705 Pronto! {result['size_mb']} MB")
+        else:
+            await query.message.reply_text(f"\u274c Erro: {result.get('error')}")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
     if action == "processar":
         await query.edit_message_text("⏳ Processando vídeo...")
         result = await _processar(update, ctx)
