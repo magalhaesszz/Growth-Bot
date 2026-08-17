@@ -166,6 +166,8 @@ def _run_follow_job_sync(ignore_schedule: bool = False) -> list[str]:
 
 async def run_follow_job(ignore_schedule: bool = False):
     notifications = await asyncio.to_thread(_run_follow_job_sync, ignore_schedule)
+    # Auto-unfollow quem seguiu de volta
+    await asyncio.to_thread(_auto_unfollow_follow_backs_sync)
     for message in notifications:
         await _notify(message)
 
@@ -268,6 +270,47 @@ async def run_anomaly_check():
 # Modo manual
 _MANUAL_MODE: bool = False
 _MANUAL_TASK = None
+
+
+def _auto_unfollow_follow_backs_sync():
+    """Checa quem seguiu de volta e faz unfollow automatico."""
+    try:
+        from database.accounts import AccountsDB
+        from database.operations import DB
+        from instagram.client import InstagramClient
+        from instagram.unfollower import Unfollower
+        from instagram.score import WhitelistFilter
+
+        adb = AccountsDB()
+        db  = DB()
+        accounts = adb.list_active_accounts()
+
+        for acc in accounts:
+            username = acc["username"]
+            ig = InstagramClient(username, acc.get("password",""), acc.get("fingerprint"))
+            sess = adb.load_session_backup(username)
+            if sess:
+                ig.load_session_from_data(sess)
+            elif not ig.is_logged_in():
+                continue
+
+            wl = WhitelistFilter(db.get_whitelist(acc["id"]))
+            unfollower = Unfollower(ig, risk_detector, wl)
+            count = unfollower.auto_unfollow_follow_backs(
+                acc["id"], db,
+                daily_limit=acc.get("daily_unfollows", 50),
+                delay_min=acc.get("delay_min", 30),
+                delay_max=acc.get("delay_max", 90),
+            )
+            if count > 0:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(
+                    _notify(f"🔄 @{username}: {count} auto-unfollows (seguiram de volta)"),
+                    asyncio.get_event_loop()
+                )
+    except Exception as e:
+        logger.error(f"Erro no auto_unfollow_follow_backs: {e}")
+
 
 async def run_manual_mode():
     """Roda follow job continuamente até _MANUAL_MODE = False."""
