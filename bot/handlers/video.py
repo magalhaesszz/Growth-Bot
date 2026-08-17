@@ -91,12 +91,8 @@ async def receber_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return ConversationHandler.END
 
-    # Baixar bytes e salvar no Supabase
+    video_bytes = result["video_bytes"]
     await status_msg.edit_text("⏳ Salvando no banco...")
-    video_bytes = await asyncio.to_thread(vc.buscar_video_baixado, result["job_id"])
-    if not video_bytes:
-        await status_msg.edit_text("❌ Erro ao recuperar o vídeo do servidor.")
-        return ConversationHandler.END
 
     storage_path = await asyncio.to_thread(
         vdb.upload_video, video_bytes, result["filename"], _uid(update))
