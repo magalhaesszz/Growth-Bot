@@ -136,6 +136,7 @@ def _video_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_button("Status da API", "dash:video:status")],
         [_button("Enviar fundo", "dash:video:set_fundo"), _button("Ver fundo", "dash:video:get_fundo")],
+        [_button("Baixar link", "dash:video:download"), _button("Biblioteca", "dash:video:biblioteca")],
         [_button("Processar video", "dash:video:process"), _button("Modo lote", "dash:video:lote")],
         [_button("Editor visual (arrastar)", "dash:video:editor")],
         [_button("Configuracoes", "dash:video:config"), _button("Reset config", "dash:video:config_reset")],
@@ -1111,14 +1112,15 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             accounts_db.update_settings(acc["username"], {"unfollow_policy": policy})
             await _show(update, "Regra de unfollow atualizada.\n\n" + _config_text(ctx), _config_keyboard())
         elif data == "dash:video":
-            await _show(update,
-                "*Editor de Video*\n\n"
-                "Use os comandos abaixo para editar vídeos:\n\n"
-                "/download — Baixar do Instagram/TikTok\n"
-                "/video — Enviar arquivo MP4\n"
-                "/video_lote — Processar vários vídeos\n"
-                "/video_status — Status da API",
-                InlineKeyboardMarkup([[_button("Voltar", "dash:home")]]))
+            await _show(update, _video_home_text(), _video_keyboard())
+        elif data == "dash:video:download":
+            await query.message.reply_text(
+                "Use /download para baixar do Instagram ou TikTok.")
+            await _show(update, _video_home_text(), _video_keyboard())
+        elif data == "dash:video:biblioteca":
+            await query.message.reply_text(
+                "Use /biblioteca para ver seus videos salvos.")
+            await _show(update, _video_home_text(), _video_keyboard())
         elif data == "dash:video:status":
             status = await asyncio.to_thread(vc.api_status)
             await _show(update, _video_status_text(status), _video_keyboard())
