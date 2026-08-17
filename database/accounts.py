@@ -168,6 +168,13 @@ class AccountsDB:
             logger.info("Conta adicionada: %s", username)
         return res.data[0] if res.data else {}
 
+    def get_account_by_id(self, account_id: str) -> dict | None:
+        res = self.sb.table("ig_accounts").select("*").eq("id", account_id).execute()
+        if res.data:
+            res.data[0]["password"] = _decrypt(res.data[0]["password_enc"])
+            return res.data[0]
+        return None
+
     def get_account(self, username: str) -> dict | None:
         res = (
             self.sb.table("ig_accounts")
