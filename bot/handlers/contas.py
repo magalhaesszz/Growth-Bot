@@ -26,7 +26,9 @@ AGUARDANDO_2FA     = 3
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != TELEGRAM_OWNER_ID:
+        from bot.access import is_owner
+        uid = update.effective_user.id if update.effective_user else 0
+        if not is_owner(uid):  # contas Instagram: só o dono gerencia
             if update.message:
                 await update.message.reply_text("⛔ Acesso negado.")
             return ConversationHandler.END
