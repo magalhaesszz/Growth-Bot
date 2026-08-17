@@ -179,13 +179,20 @@ def _video_status_text(status: dict) -> str:
 
 def _usuarios_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [_button("Ver todos", "dash:usuarios:lista"),
-         _button("Adicionar usuario", "dash:usuarios:add")],
-        [_button("Add admin 👑", "dash:usuarios:add_admin"),
-         _button("Remover", "dash:usuarios:remove")],
-        [_button("Detalhes", "dash:usuarios:detalhes"),
-         _button("Recarregar", "dash:usuarios:reload")],
-        [_button("Voltar", "dash:home")],
+        [_button("👥 Ver e gerenciar", "dash:usuarios:lista")],
+        [_button("➕ Adicionar por ID",    "dash:usuarios:add_id")],
+        [_button("🔄 Recarregar",      "dash:usuarios:reload"),
+         _button("Voltar",                     "dash:home")],
+    ])
+
+
+def _usuario_detail_keyboard(uid: int, is_admin: bool) -> InlineKeyboardMarkup:
+    toggle    = "⬇️ Remover admin" if is_admin else "👑 Tornar admin"
+    toggle_cb = f"dash:usr:demote:{uid}" if is_admin else f"dash:usr:promote:{uid}"
+    return InlineKeyboardMarkup([
+        [_button(toggle,               toggle_cb)],
+        [_button("🗑 Remover", f"dash:usr:remove:{uid}")],
+        [_button("Voltar",             "dash:usuarios:lista")],
     ])
 
 def _safe(value, default="-"):
@@ -708,9 +715,70 @@ def _has_dashboard_access(user_id: int) -> bool:
 
 
 async def _handle_usuarios(update, ctx, data: str):
-    if data in ("dash:usuarios", "dash:usuarios:lista", "dash:usuarios:reload"):
-        _load_usuarios()
+    from bot.access import get_all_users, save_user, remove_user
+    from datetime import datetime
+
+    if data in ("dash:usuarios", "dash:usuarios:reload"):
         await _show(update, _usuarios_text(), _usuarios_keyboard())
+
+    elif data == "dash:usuarios:lista":
+        users = get_all_users()
+        if not users:
+            await _show(update,
+                "*Nenhum usuario cadastrado ainda.*\n\nUse *Adicionar por ID* para o primeiro.",
+                _usuarios_keyboard())
+            return
+        rows = []
+        for uid, info in users.items():
+            crown = "\U0001f451 " if info.get("is_admin") else ""
+            name  = info.get("username") or str(uid)
+            rows.append([_button(f"{crown}@{name}", f"dash:usr:detail:{uid}")])
+        rows.append([_button("Voltar", "dash:usuarios")])
+        await _show(update,
+            f"*Usuarios ({len(users)})*\nToque para gerenciar:",
+            InlineKeyboardMarkup(rows))
+
+    elif data == "dash:usuarios:add_id":
+        _prompt(ctx, "usuarios_add")
+        await _show(update,
+            "*Adicionar usuario por ID*\n\n"
+            "Envie o ID numerico do Telegram.\n"
+            "_Para descobrir: peca ao usuario enviar /start — o ID aparece nos logs._",
+            InlineKeyboardMarkup([[_button("Cancelar", "dash:usuarios")]]))
+
+    elif data.startswith("dash:usr:detail:"):
+        uid   = int(data.split(":")[-1])
+        users = get_all_users()
+        info  = users.get(uid, {})
+        name  = info.get("username") or str(uid)
+        admin = info.get("is_admin", False)
+        crown = "\U0001f451 Admin" if admin else "Usuario comum"
+        await _show(update,
+            f"*@{name}*\nID: `{uid}`\nTipo: {crown}\nDesde: {info.get('added_at','?')}\n\nEscolha:",
+            _usuario_detail_keyboard(uid, admin))
+
+    elif data.startswith("dash:usr:promote:"):
+        uid  = int(data.split(":")[-1])
+        info = dict(get_all_users().get(uid, {}))
+        info["is_admin"] = True
+        save_user(uid, info)
+        name = info.get("username") or str(uid)
+        await _show(update, f"\U0001f451 @{name} agora e *Admin*!", _usuarios_keyboard())
+
+    elif data.startswith("dash:usr:demote:"):
+        uid  = int(data.split(":")[-1])
+        info = dict(get_all_users().get(uid, {}))
+        info["is_admin"] = False
+        save_user(uid, info)
+        name = info.get("username") or str(uid)
+        await _show(update, f"@{name} voltou a ser *usuario comum*.", _usuarios_keyboard())
+
+    elif data.startswith("dash:usr:remove:"):
+        uid  = int(data.split(":")[-1])
+        info = get_all_users().get(uid, {})
+        name = info.get("username") or str(uid)
+        remove_user(uid)
+        await _show(update, f"\U0001f5d1 @{name} removido.", _usuarios_keyboard())
     elif data == "dash:usuarios:add":
         _prompt(ctx, "usuarios_add")
         await _show(update,
@@ -757,8 +825,8 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
     if action == "usuarios_add":
         if not text.isdigit():
             await msg.reply_text(
-                "\u26a0\ufe0f Envie o *ID numerico* do usuario.\n"
-                "Para saber o ID, peca ao usuario enviar /start no bot e veja nos logs.",
+                "\u26a0\ufe0f Envie apenas o *ID numerico*.\n"
+                "_Para descobrir: peca ao usuario enviar /start — o ID aparece nos logs._",
                 parse_mode="Markdown")
             return
         uid = int(text)
