@@ -53,6 +53,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [_button("Relatorio", "dash:report"), _button("Seguranca", "dash:safety")],
         [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
         [_button("Rodar agora", "dash:manual_start"), _button("Parar", "dash:manual_stop")],
+        [_button("Limpar nao-seguidores", "dash:unfollow_naobot")],
         [_button("Editor de Video", "dash:video")],
         [_button("Usuarios", "dash:usuarios")],
         [_button("Configuracoes", "dash:config_conta")],
@@ -914,6 +915,69 @@ async def _handle_cfg_conta_pending(update, ctx, text: str):
         await msg.reply_text(f"Erro ao salvar: {e}")
     ctx.user_data.pop("dashboard_pending", None)
 
+
+async def _handle_unfollow_naobot(update, ctx):
+    """Abre submenu para desfollowear quem nao segue de volta (seguidos fora do bot)."""
+    keyboard = InlineKeyboardMarkup([
+        [_button("Ver quantos sao", "dash:unfollow_naobot:contar")],
+        [_button("Executar agora",  "dash:unfollow_naobot:executar")],
+        [_button("Voltar",          "dash:home")],
+    ])
+    await _show(update,
+        "*Limpar nao-seguidores externos*\n\n"
+        "Remove follows que voce fez fora do bot e que nao seguem de volta.\n"
+        "O bot checa quem voce segue no Instagram vs quem seguiu de volta.",
+        keyboard)
+
+
+async def _handle_unfollow_naobot_contar(update, ctx):
+    from database.accounts import AccountsDB
+    from database.operations import DB
+    adb = AccountsDB()
+    db  = DB()
+    accounts = adb.list_active_accounts()
+    if not accounts:
+        await _show(update, "Nenhuma conta ativa.", _back_keyboard())
+        return
+    acc = accounts[0]
+    # Buscar quem o bot seguiu e que ainda esta como "following"
+    bot_following = db.get_already_following_ids(acc["id"])
+    # Buscar quem segue de volta
+    follow_backs = db.sb.table("ig_followed")\
+        .select("target_user_id")\
+        .eq("account_id", acc["id"])\
+        .eq("follows_back", True)\
+        .execute().data or []
+    follow_back_ids = {r["target_user_id"] for r in follow_backs}
+    nao_seguem = bot_following - follow_back_ids
+    await _show(update,
+        f"*Nao-seguidores — @{acc['username']}*\n\n"
+        f"Bot segue: *{len(bot_following)}* pessoas\n"
+        f"Seguem de volta: *{len(follow_back_ids)}*\n"
+        f"Nao seguem de volta: *{len(nao_seguem)}*\n\n"
+        f"Clique em *Executar agora* para fazer unfollow dessas {len(nao_seguem)} pessoas.",
+        InlineKeyboardMarkup([
+            [_button("Executar agora", "dash:unfollow_naobot:executar")],
+            [_button("Voltar",         "dash:unfollow_naobot")],
+        ]))
+
+
+async def _handle_unfollow_naobot_executar(update, ctx):
+    from database.accounts import AccountsDB
+    from scheduler.jobs import run_unfollow_external_job
+    adb = AccountsDB()
+    accounts = adb.list_active_accounts()
+    if not accounts:
+        await _show(update, "Nenhuma conta ativa.", _back_keyboard())
+        return
+    acc = accounts[0]
+    await _show(update,
+        f"Iniciando unfollow de nao-seguidores para @{acc['username']}...\n"
+        "Isso pode levar alguns minutos.",
+        _back_keyboard())
+    import asyncio
+    asyncio.create_task(run_unfollow_external_job(acc["username"]))
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1199,6 +1263,12 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await stop_manual_mode()
                 await _show(update, "Modo manual encerrado!", _main_keyboard())
+        elif data == "dash:unfollow_naobot":
+            await _handle_unfollow_naobot(update, ctx)
+        elif data == "dash:unfollow_naobot:contar":
+            await _handle_unfollow_naobot_contar(update, ctx)
+        elif data == "dash:unfollow_naobot:executar":
+            await _handle_unfollow_naobot_executar(update, ctx)
         elif data.startswith("dash:config_conta") or data.startswith("dash:cfg_conta:"):
             await _handle_config_conta(update, ctx, data)
         elif data.startswith("dash:usuarios"):
