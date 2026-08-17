@@ -94,32 +94,40 @@ async def receber_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     video_bytes = result["video_bytes"]
-    await status_msg.edit_text("⏳ Salvando no banco...")
+    filename    = result["filename"]
+    size_mb     = result["size_mb"]
 
-    storage_path = await asyncio.to_thread(
-        vdb.upload_video, video_bytes, result["filename"], _uid(update))
-    if not storage_path:
-        await status_msg.edit_text("❌ Erro ao salvar no banco. Tente novamente.")
-        return ConversationHandler.END
+    # Salvar no banco (opcional — não bloqueia se falhar)
+    video_id = ""
+    try:
+        await status_msg.edit_text("⏳ Salvando na biblioteca...")
+        storage_path = await asyncio.to_thread(
+            vdb.upload_video, video_bytes, filename, _uid(update))
+        if storage_path:
+            record   = await asyncio.to_thread(
+                vdb.save_video, _uid(update), filename,
+                storage_path, url, size_mb)
+            video_id = record.get("id", "")
+            ctx.user_data["dl_storage_path"] = storage_path
+    except Exception as e:
+        logger.warning(f"Erro ao salvar no banco (nao critico): {e}")
 
-    record = await asyncio.to_thread(
-        vdb.save_video, _uid(update), result["filename"],
-        storage_path, url, result["size_mb"])
-
-    ctx.user_data["dl_video_id"]    = record.get("id", "")
-    ctx.user_data["dl_storage_path"]= storage_path
-    ctx.user_data["dl_filename"]    = result["filename"]
+    # Guardar bytes em memória como fallback
+    ctx.user_data["dl_video_id"]    = video_id
+    ctx.user_data["dl_video_bytes"] = video_bytes
+    ctx.user_data["dl_filename"]    = filename
     ctx.user_data["dl_edits"]       = {}
 
+    saved = "Salvo na biblioteca!" if video_id else "Pronto!"
     await status_msg.edit_text(
-        f"✅ *Salvo na biblioteca!* ({result['size_mb']} MB)\n"
-        f"📄 `{result['filename']}`\n\n"
-        f"Escolha as edições:",
+        f"\u2705 *{saved}* ({size_mb} MB)\n"
+        f"\U0001f3ac `{filename}`\n\n"
+        f"Agora escolha as edicoes:",
         parse_mode="Markdown"
     )
     await update.message.reply_text(
-        "Edições disponíveis:",
-        reply_markup=_menu_edicao_kb({}, record.get("id","")))
+        "\U0001f3a8 Fundo  \u2702\ufe0f Cortar  \U0001f4a7 Marca  \U0001f4dd Legenda  \u25b6\ufe0f Processar",
+        reply_markup=_menu_edicao_kb({}, video_id))
     return AGUARDANDO_LINK
 
 
@@ -151,16 +159,32 @@ async def receber_mp4(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     record = await asyncio.to_thread(
         vdb.save_video, _uid(update), filename, storage_path, "", size_mb)
 
-    ctx.user_data["dl_video_id"]     = record.get("id", "")
-    ctx.user_data["dl_storage_path"] = storage_path
-    ctx.user_data["dl_filename"]     = filename
-    ctx.user_data["dl_edits"]        = {}
+    # Salvar no banco (opcional)
+    video_id = ""
+    try:
+        storage_path = await asyncio.to_thread(
+            vdb.upload_video, video_bytes, filename, _uid(update))
+        if storage_path:
+            record   = await asyncio.to_thread(
+                vdb.save_video, _uid(update), filename, storage_path, "", size_mb)
+            video_id = record.get("id", "")
+            ctx.user_data["dl_storage_path"] = storage_path
+    except Exception as e:
+        logger.warning(f"Erro ao salvar mp4 no banco: {e}")
 
+    ctx.user_data["dl_video_id"]    = video_id
+    ctx.user_data["dl_video_bytes"] = video_bytes
+    ctx.user_data["dl_filename"]    = filename
+    ctx.user_data["dl_edits"]       = {}
+
+    saved = "Salvo na biblioteca!" if video_id else "Pronto!"
     await status_msg.edit_text(
-        f"✅ *Salvo!* ({size_mb} MB)\n📄 `{filename}`\n\nEscolha as edições:",
+        f"\u2705 *{saved}* ({size_mb} MB)\n\U0001f3ac `{filename}`",
         parse_mode="Markdown"
     )
-    await msg.reply_text("Edições:", reply_markup=_menu_edicao_kb({}, record.get("id","")))
+    await msg.reply_text(
+        "\U0001f3a8 Fundo  \u2702\ufe0f Cortar  \U0001f4a7 Marca  \U0001f4dd Legenda  \u25b6\ufe0f Processar",
+        reply_markup=_menu_edicao_kb({}, video_id))
     return AGUARDANDO_LINK
 
 
@@ -330,10 +354,14 @@ async def _processar(update, ctx) -> dict:
     fname    = ctx.user_data.get("dl_filename", "video.mp4")
     edits    = ctx.user_data.get("dl_edits", {})
 
-    if not sp:
-        return {"ok": False, "error": "Nenhum vídeo selecionado."}
+    # Tentar bytes em memória primeiro (mais rápido, sem roundtrip ao banco)
+    vid_bytes = ctx.user_data.get("dl_video_bytes")
 
-    vid_bytes = await asyncio.to_thread(vdb.download_video, sp)
+    if not vid_bytes and sp:
+        vid_bytes = await asyncio.to_thread(vdb.download_video, sp)
+
+    if not vid_bytes and not sp:
+        return {"ok": False, "error": "Nenhum video disponivel. Use /download novamente."}
     if not vid_bytes:
         return {"ok": False, "error": "Não foi possível recuperar o vídeo do banco."}
 
