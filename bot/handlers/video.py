@@ -25,6 +25,7 @@ AGUARDANDO_LINK         = 15
 AGUARDANDO_WATERMARK    = 16
 AGUARDANDO_CAPTION      = 17
 AGUARDANDO_CROP         = 18
+AGUARDANDO_FUNDO_DL     = 19
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -119,12 +120,12 @@ async def on_download_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "fundo":
         await query.edit_message_text(
-            "🎨 Fundo: use /fundo para cadastrar um fundo e ele será aplicado no processamento.\n\n"
-            "Voltando ao menu...",
+            "🎨 *Envie a imagem de fundo*\n\n"
+            "PNG ou JPG, ideal 1080x1920px.\n"
+            "Ou envie /pular para continuar sem fundo.",
             parse_mode="Markdown"
         )
-        await _mostrar_menu_edicao(query.message, filename, edits)
-        return AGUARDANDO_LINK
+        return AGUARDANDO_FUNDO_DL
 
     if action == "watermark":
         ctx.user_data["dl_pending"] = "watermark"
@@ -279,6 +280,43 @@ async def receber_crop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update.message,
         ctx.user_data.get("dl_filename", "video.mp4"),
         ctx.user_data.get("dl_edits", {})
+    )
+    return AGUARDANDO_LINK
+
+
+
+async def receber_fundo_dl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg   = update.message
+    edits = ctx.user_data.setdefault("dl_edits", {})
+
+    photo = msg.photo or (
+        msg.document if msg.document and
+        msg.document.mime_type and
+        msg.document.mime_type.startswith("image") else None
+    )
+
+    if not photo:
+        await msg.reply_text("❌ Envie uma imagem PNG ou JPG.")
+        return AGUARDANDO_FUNDO_DL
+
+    file_obj    = await (photo[-1] if isinstance(photo, list) else photo).get_file()
+    fundo_bytes = bytes(await file_obj.download_as_bytearray())
+    filename_fundo = getattr(msg.document, "file_name", "fundo.png") if msg.document else "fundo.png"
+
+    result = await asyncio.to_thread(
+        vc.salvar_fundo, fundo_bytes, filename_fundo, _account_id(update)
+    )
+
+    if result.get("ok"):
+        edits["fundo"] = True
+        await msg.reply_text("✅ Fundo salvo! Será aplicado ao processar.")
+    else:
+        await msg.reply_text(f"❌ Erro ao salvar fundo: {result.get('error')}")
+
+    await _mostrar_menu_edicao(
+        msg,
+        ctx.user_data.get("dl_filename", "video.mp4"),
+        edits
     )
     return AGUARDANDO_LINK
 
@@ -760,6 +798,10 @@ def register_video_handlers(app):
             ],
             AGUARDANDO_CROP: [
                 MessageHandler(filters.TEXT, receber_crop),
+            ],
+            AGUARDANDO_FUNDO_DL: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receber_fundo_dl),
+                CommandHandler("pular", lambda u, c: receber_fundo_dl(u, c)),
             ],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
