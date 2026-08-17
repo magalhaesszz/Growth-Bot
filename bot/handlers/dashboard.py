@@ -690,22 +690,21 @@ def _delete_usuario(user_id: int):
 
 
 def _usuarios_text() -> str:
-    _load_usuarios()
-    if not _ALLOWED_USERS:
+    from bot.access import get_all_users
+    users = get_all_users()
+    if not users:
         return "*Usuarios autorizados*\n\nNenhum usuario cadastrado ainda."
     lines = ["*Usuarios autorizados:*\n"]
-    for uid, info in _ALLOWED_USERS.items():
+    for uid, info in users.items():
         name = info.get("username") or str(uid)
-        admin = " 👑" if info.get("is_admin") else ""
+        admin = " \U0001f451" if info.get("is_admin") else ""
         lines.append(f"\u2022 @{name} (`{uid}`){admin} \u2014 {info.get('added_at','?')} ")
     return "\n".join(lines)
 
 
 def _has_dashboard_access(user_id: int) -> bool:
-    if user_id == TELEGRAM_OWNER_ID:
-        return True
-    _load_usuarios()
-    return user_id in _ALLOWED_USERS
+    from bot.access import has_access
+    return has_access(user_id)
 
 
 async def _handle_usuarios(update, ctx, data: str):
@@ -778,8 +777,8 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
             "added_at": datetime.now().strftime("%d/%m/%Y"),
             "is_admin": is_admin,
         }
-        _ALLOWED_USERS[uid] = data
-        _save_usuario(uid, data)
+        from bot.access import save_user
+        save_user(uid, data)
         tipo = "Admin \U0001f451" if is_admin else "Usuario"
         # Notificar o usuario automaticamente
         try:
@@ -810,8 +809,9 @@ async def _handle_usuarios_pending(update, ctx, action: str, text: str):
             return
         uid = int(text)
         if uid in _ALLOWED_USERS:
-            info = _ALLOWED_USERS.pop(uid)
-            _delete_usuario(uid)
+            from bot.access import get_all_users, remove_user
+            info = get_all_users().get(uid, {})
+            remove_user(uid)
             await msg.reply_text(
                 f"\U0001f5d1 @{info.get('username',uid)} removido.",
                 parse_mode="Markdown")
