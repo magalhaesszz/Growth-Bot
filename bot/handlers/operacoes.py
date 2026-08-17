@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 from telegram import Update
@@ -511,6 +512,141 @@ async def cmd_retomar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             count += 1
     await update.message.reply_text(f"▶️ {count} conta(s) retomada(s).")
 
+
+
+@owner_only
+async def cmd_seguidos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    acc = _first_account()
+    if not acc:
+        await update.message.reply_text("Nenhuma conta ativa.")
+        return
+    db   = DB()
+    rows = db.get_following_list(acc["id"], limit=30)
+    if not rows:
+        await update.message.reply_text("Nenhum seguido registrado ainda.")
+        return
+    n = len(rows)
+    lines = [f"*Ultimos {n} seguidos:*\n"]
+    for r in rows:
+        fb   = "\u2705" if r.get("follows_back") else "\u274c"
+        date = (r.get("followed_at") or "")[:10]
+        lines.append(f"{fb} @{r['target_username']} \u2014 {date}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@owner_only
+async def cmd_nao_seguem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    acc = _first_account()
+    if not acc:
+        await update.message.reply_text("Nenhuma conta ativa.")
+        return
+    limite = 0
+    if ctx.args:
+        try: limite = int(ctx.args[0])
+        except Exception: pass
+    db   = DB()
+    rows = db.get_non_followers(acc["id"], limit=limite)
+    if not rows:
+        await update.message.reply_text("\u2705 Todos seguem de volta!")
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    n = len(rows)
+    lines = [f"*{n} nao seguem de volta:*\n"]
+    for r in rows[:20]:
+        date = (r.get("followed_at") or "")[:10]
+        lines.append(f"\u2022 @{r['target_username']} \u2014 {date}")
+    if n > 20:
+        lines.append(f"_... e mais {n-20}_")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"\U0001f5d1 Deixar de seguir todos ({n})",
+            callback_data=f"unfollow_batch:{acc['id']}:{limite}"
+        )],
+        [InlineKeyboardButton("\u274c Cancelar", callback_data="unfollow_cancel")],
+    ])
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=keyboard, parse_mode="Markdown")
+
+
+@owner_only
+async def cmd_deixar_seguir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Uso: /deixar_seguir @usuario")
+        return
+    acc = _first_account()
+    if not acc:
+        await update.message.reply_text("Nenhuma conta ativa.")
+        return
+    username = ctx.args[0].lstrip("@")
+    db   = DB()
+    rows = db.get_following_list(acc["id"], limit=500)
+    target = next((r for r in rows if r["target_username"] == username), None)
+    if not target:
+        await update.message.reply_text(f"@{username} nao encontrado nos seguidos.")
+        return
+    from database.accounts import AccountsDB
+    from instagram.client import InstagramClient
+    adb  = AccountsDB()
+    ig   = InstagramClient(acc["username"], acc.get("password",""))
+    sess = adb.load_session_backup(acc["username"])
+    if sess:
+        ig.load_session_from_data(sess)
+    await update.message.reply_text(f"\u23f3 Parando de seguir @{username}...")
+    try:
+        def _do():
+            ig.api.user_unfollow(int(target["target_user_id"]))
+            db.unfollow_user_by_username(acc["id"], username)
+            db.log_action(acc["id"], "unfollow", username, "manual", True)
+        await asyncio.to_thread(_do)
+        await update.message.reply_text(f"\u2705 Parou de seguir @{username}.")
+    except Exception as e:
+        await update.message.reply_text(f"\u274c Erro: {e}")
+
+
+async def on_unfollow_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "unfollow_cancel":
+        await query.edit_message_text("\u274c Cancelado.")
+        return
+    if not query.data.startswith("unfollow_batch:"):
+        return
+    parts  = query.data.split(":")
+    acc_id = parts[1]
+    limite = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+    await query.edit_message_text("\u23f3 Executando unfollows...")
+    from database.accounts import AccountsDB
+    from instagram.client import InstagramClient
+    from instagram.unfollower import Unfollower
+    from instagram.score import WhitelistFilter
+    from scheduler.jobs import risk_detector
+    adb = AccountsDB()
+    db  = DB()
+    acc = adb.get_account_by_id(acc_id)
+    if not acc:
+        await query.edit_message_text("\u274c Conta nao encontrada.")
+        return
+    ig   = InstagramClient(acc["username"], acc.get("password",""))
+    sess = adb.load_session_backup(acc["username"])
+    if sess:
+        ig.load_session_from_data(sess)
+    rows = db.get_non_followers(acc_id, limit=limite)
+    wl   = WhitelistFilter(db.get_whitelist(acc_id))
+    unfollower = Unfollower(ig, risk_detector, wl)
+    def _do():
+        return unfollower.unfollow_batch(
+            rows,
+            daily_limit=acc.get("daily_unfollows", 50),
+            delay_min=acc.get("delay_min", 30),
+            delay_max=acc.get("delay_max", 90),
+            on_success=lambda u, uid, kept: db.unfollow_user_by_username(acc_id, u) if not kept else None,
+            policy="keep_follow_backs",
+        )
+    result = await asyncio.to_thread(_do)
+    await query.message.reply_text(
+        f"\u2705 Unfollow concluido!\n"
+        f"Removidos: *{result['unfollowed']}* | Erros: {result['errors']}",
+        parse_mode="Markdown")
 
 def register_operacoes_handlers(app):
     handlers = [
