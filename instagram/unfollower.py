@@ -48,6 +48,49 @@ class Unfollower:
             logger.warning(f"Erro ao checar friendship de {user_id}: {e}")
             return True  # em caso de dúvida, mantém o follow
 
+    def auto_unfollow_follow_backs(
+        self,
+        account_id: str,
+        db,
+        daily_limit: int,
+        delay_min: int,
+        delay_max: int,
+    ) -> int:
+        """
+        Checa quem seguiu de volta e faz unfollow automatico.
+        Retorna quantos foram removidos.
+        """
+        count = 0
+        try:
+            following = db.get_following_list(account_id, limit=500)
+        except Exception as e:
+            logger.error(f"Erro ao buscar following: {e}")
+            return 0
+
+        for entry in following:
+            if not self._can_unfollow(daily_limit):
+                break
+            uid   = entry.get("target_user_id", "")
+            uname = entry.get("target_username", "")
+            if not uid or not uname:
+                continue
+            # Checar se segue de volta agora
+            if self._follows_back(uid):
+                try:
+                    self.cl.user_unfollow(int(uid))
+                    db.mark_unfollowed(account_id, uname)
+                    db.mark_follows_back(account_id, uname)
+                    db.log_action(account_id, "unfollow", uname, "auto_follow_back", True)
+                    self._unfollowed_today += 1
+                    self.client.save_session()
+                    count += 1
+                    logger.info(f"[{self.username}] Auto-unfollow @{uname} (seguiu de volta) ✓")
+                    time.sleep(random.uniform(delay_min, delay_max))
+                except Exception as e:
+                    logger.error(f"[{self.username}] Erro auto-unfollow @{uname}: {e}")
+                    time.sleep(random.uniform(10, 20))
+        return count
+
     def unfollow_batch(
         self,
         candidates: list[dict],
