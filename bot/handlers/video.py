@@ -64,11 +64,12 @@ def _menu_edicao_kb(edits: dict, video_id: str = "") -> InlineKeyboardMarkup:
         # Linha 3: Velocidade e Flip
         [InlineKeyboardButton("\u23e9 Velocidade",    callback_data=f"dl:speed{suffix}"),
          InlineKeyboardButton("\U0001f503 Espelhar",  callback_data=f"dl:flip{suffix}")],
-        # Linha 4: Processar
-        [InlineKeyboardButton("\u25b6\ufe0f Processar", callback_data=f"dl:processar{suffix}")],
+        # Linha 4: Editor visual e Processar
+        [InlineKeyboardButton("\U0001f5bc\ufe0f Editor visual", callback_data=f"dl:editor{suffix}"),
+         InlineKeyboardButton("\u25b6\ufe0f Processar",         callback_data=f"dl:processar{suffix}")],
         # Linha 5: Biblioteca e Cancelar
         [InlineKeyboardButton("\U0001f5c2 Biblioteca", callback_data="dl:biblioteca"),
-         InlineKeyboardButton("\u274c Cancelar",      callback_data="dl:cancelar")],
+         InlineKeyboardButton("\u274c Cancelar",       callback_data="dl:cancelar")],
     ])
 
 
@@ -323,6 +324,36 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✂️ *Cortar*\n\nDigite início-fim em segundos (ex: `5-30`):\n/pular para não cortar.",
             parse_mode="Markdown")
         return AGUARDANDO_CROP
+
+    if action.startswith("editor_apply:"):
+        token  = action.split(":", 1)[1]
+        stored = ctx.user_data.get("dl_editor_token")
+        source = ctx.user_data.get("dl_editor_source")
+        if not source or token != stored:
+            await query.edit_message_text("\u274c Sessao do editor expirada. Use dl:editor novamente.")
+            return AGUARDANDO_LINK
+        editor = await asyncio.to_thread(vc.obter_editor_result, token)
+        if not editor.get("ok"):
+            await query.edit_message_text(f"\u274c Editor expirado: {editor.get('error')}")
+            return AGUARDANDO_LINK
+        editable = {
+            k: v for k, v in editor["config"].items()
+            if k in video_settings.DEFAULTS
+        }
+        config = video_settings.set_values(_uid(update), editable)
+        vid_bytes, fname = source
+        await query.message.reply_text("\u23f3 Aplicando layout e processando...")
+        result = await asyncio.to_thread(
+            vc.processar_video, vid_bytes, fname, str(_uid(update)), config)
+        if result.get("ok"):
+            await query.message.reply_video(
+                video=result["video_bytes"],
+                filename=result["filename"],
+                caption=f"\u2705 Pronto! {result['size_mb']} MB")
+        else:
+            await query.message.reply_text(f"\u274c Erro: {result.get('error')}")
+        ctx.user_data.clear()
+        return ConversationHandler.END
 
     if action == "processar":
         await query.edit_message_text("⏳ Processando vídeo...")
