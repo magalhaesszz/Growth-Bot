@@ -334,3 +334,91 @@ def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
     scheduler.add_job(run_daily_report_job, CronTrigger(hour=22, minute=15), id="daily_report")
 
     return scheduler
+
+
+async def run_unfollow_external_job(username: str):
+    """
+    Faz unfollow de contas que o usuario segue mas que nao seguem de volta.
+    Funciona para follows feitos FORA do bot tambem.
+    """
+    import asyncio
+    from database.accounts import AccountsDB
+    from database.operations import DB
+    from instagram.client import InstagramClient
+    from instagram.unfollower import Unfollower
+    from instagram.score import WhitelistFilter
+
+    adb = AccountsDB()
+    db  = DB()
+    acc = adb.get_account(username)
+    if not acc:
+        return
+
+    # Restaurar sessao
+    ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
+    sess = adb.load_session_backup(username)
+    if sess:
+        ig.load_session_from_data(sess)
+    elif not ig.is_logged_in():
+        await _notify(f"❌ Nao foi possivel autenticar @{username} para unfollow externo.")
+        return
+
+    # Buscar quem segue no Instagram via API
+    try:
+        following_raw = ig.api.user_following(ig.api.user_id)
+        following_ids = {str(uid) for uid in following_raw.keys()}
+    except Exception as e:
+        await _notify(f"❌ Erro ao buscar following de @{username}: {e}")
+        return
+
+    # Buscar quem segue de volta
+    follow_backs = {
+        r["target_user_id"]
+        for r in (db.sb.table("ig_followed")
+            .select("target_user_id")
+            .eq("account_id", acc["id"])
+            .eq("follows_back", True)
+            .execute().data or [])
+    }
+
+    # Quem nao segue de volta
+    nao_seguem = following_ids - follow_backs
+    if not nao_seguem:
+        await _notify(f"✅ @{username} — nenhum nao-seguidor encontrado.")
+        return
+
+    await _notify(
+        f"🔄 Iniciando unfollow de *{len(nao_seguem)}* nao-seguidores "
+        f"de @{username}..."
+    )
+
+    wl = WhitelistFilter(db.get_whitelist(acc["id"]))
+    unfollower = Unfollower(ig, risk_detector, wl)
+
+    # Montar lista de candidatos no formato esperado
+    candidates = [
+        {"target_user_id": uid, "target_username": following_raw.get(int(uid), type("u", (), {"username": uid})()).username}
+        for uid in nao_seguem
+    ]
+
+    count = 0
+    for c in candidates:
+        if risk_detector.is_paused(username):
+            break
+        try:
+            ig.api.user_unfollow(c["target_user_id"])
+            db.mark_unfollowed(acc["id"], c["target_username"])
+            db.log_action(acc["id"], "unfollow", c["target_username"], success=True)
+            count += 1
+            import time, random
+            time.sleep(random.uniform(
+                acc.get("delay_min", 30),
+                acc.get("delay_max", 90)
+            ))
+        except Exception as e:
+            logger.error(f"[{username}] Erro unfollow externo {c['target_username']}: {e}")
+            db.log_action(acc["id"], "unfollow", c["target_username"], success=False)
+
+    await _notify(
+        f"✅ Unfollow externo concluído — *{count}* pessoas removidas de @{username}."
+    )
