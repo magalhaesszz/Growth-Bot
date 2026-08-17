@@ -100,5 +100,51 @@ class VideoDB:
     def update_status(self, video_id: str, status: str):
         self.sb.table("videos").update({"status": status}).eq("id", video_id).execute()
 
+    # ─── Fundo ───────────────────────────────────────────────
+
+    def save_fundo(self, user_id: int, fundo_bytes: bytes, filename: str) -> str | None:
+        """Salva fundo no Storage, substituindo o anterior."""
+        path = f"fundos/{user_id}/fundo.png"
+        try:
+            # Tenta remover o anterior antes de fazer upload
+            try:
+                self.sb.storage.from_(self.BUCKET).remove([path])
+            except Exception:
+                pass
+            self.sb.storage.from_(self.BUCKET).upload(
+                path, fundo_bytes,
+                {"content-type": "image/png", "upsert": "true"}
+            )
+            # Registrar na tabela config_fundo
+            self.sb.table("config_fundo").upsert({
+                "user_id":      user_id,
+                "storage_path": path,
+                "filename":     filename,
+            }).execute()
+            return path
+        except Exception as e:
+            logger.error(f"Erro ao salvar fundo: {e}")
+            return None
+
+    def get_fundo(self, user_id: int) -> bytes | None:
+        """Busca o fundo atual do Storage."""
+        try:
+            res = self.sb.table("config_fundo").select("storage_path")                .eq("user_id", user_id).execute()
+            if not res.data:
+                return None
+            path = res.data[0]["storage_path"]
+            return self.sb.storage.from_(self.BUCKET).download(path)
+        except Exception as e:
+            logger.error(f"Erro ao buscar fundo: {e}")
+            return None
+
+    def get_fundo_info(self, user_id: int) -> dict | None:
+        """Retorna info do fundo cadastrado."""
+        try:
+            res = self.sb.table("config_fundo").select("*")                .eq("user_id", user_id).execute()
+            return res.data[0] if res.data else None
+        except Exception:
+            return None
+
     def delete_record(self, video_id: str):
         self.sb.table("videos").update({"status": "deleted"}).eq("id", video_id).execute()
