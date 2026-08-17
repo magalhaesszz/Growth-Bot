@@ -277,6 +277,8 @@ def editar_video(
     caption_text: str = "",
     crop_start: float = 0.0,
     crop_end: float = 0.0,
+    speed: float = 0.0,
+    flip: bool = False,
 ) -> dict:
     """Aplica marca d'água, legenda e/ou corte ao vídeo."""
     try:
@@ -291,6 +293,8 @@ def editar_video(
                     "caption_text": caption_text,
                     "crop_start": str(crop_start),
                     "crop_end": str(crop_end),
+                    "speed": str(speed),
+                    "flip": str(flip).lower(),
                 },
             )
         if not response.is_success:
