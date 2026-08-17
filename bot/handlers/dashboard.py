@@ -1368,9 +1368,9 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _handle_unfollow_naobot_executar(update, ctx)
         elif data.startswith("dash:config_conta") or data.startswith("dash:cfg_conta:"):
             await _handle_config_conta(update, ctx, data)
-        elif data.startswith("dash:usuarios"):
+        elif data.startswith("dash:usuarios") or data.startswith("dash:usr:"):
             if update.effective_user.id != TELEGRAM_OWNER_ID:
-                await query.answer("Somente o proprietário gerencia usuários.", show_alert=True)
+                await query.answer("Somente o proprietario gerencia usuarios.", show_alert=True)
                 return
             await _handle_usuarios(update, ctx, data)
         elif data == "dash:safe_mode":
