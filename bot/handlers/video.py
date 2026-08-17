@@ -269,13 +269,48 @@ async def on_biblioteca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Callbacks dos botões de edição ──────────────────────────
 
 async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query  = update.callback_query
+    query    = update.callback_query
     await query.answer()
-    raw    = query.data.replace("dl:", "")
-    # Separar action de video_id (formato: action:video_id)
+    raw_data = query.data  # ex: "dl:processar", "dl:editor_apply:TOKEN"
+    raw      = raw_data.replace("dl:", "", 1)
+
+    # editor_apply tem token com ":" — tratar antes do split genérico
+    if raw.startswith("editor_apply:"):
+        token  = raw.replace("editor_apply:", "", 1)
+        stored = ctx.user_data.get("dl_editor_token")
+        source = ctx.user_data.get("dl_editor_source")
+        if not source:
+            await query.message.reply_text(
+                "\u274c Sessao expirada.\n"
+                "Use /download novamente, abra o editor e clique em Aplicar logo apos salvar.")
+            return ConversationHandler.END
+        await query.edit_message_text("\u23f3 Buscando configuracoes do editor...")
+        editor = await asyncio.to_thread(vc.obter_editor_result, token)
+        if not editor.get("ok"):
+            await query.message.reply_text(
+                "\u274c Editor expirado. Abra o editor novamente e salve antes de clicar em Aplicar.")
+            return ConversationHandler.END
+        editable = {k: v for k, v in editor.get("config", {}).items()
+                    if k in video_settings.DEFAULTS}
+        config = video_settings.set_values(_uid(update), editable)
+        vid_bytes, fname = source
+        await query.edit_message_text("\u23f3 Aplicando layout e processando...")
+        result = await asyncio.to_thread(
+            vc.processar_video, vid_bytes, fname, str(_uid(update)), config)
+        if result.get("ok"):
+            await query.message.reply_video(
+                video=result["video_bytes"],
+                filename=result["filename"],
+                caption=f"\u2705 Pronto! {result['size_mb']} MB")
+        else:
+            await query.message.reply_text(f"\u274c Erro: {result.get('error')}")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    # Split generico para outros actions (formato: action ou action:video_id)
     parts  = raw.split(":", 1)
     action = parts[0]
-    if len(parts) > 1 and parts[1]:
+    if len(parts) > 1 and parts[1] and action not in ("editor", "editor_apply"):
         ctx.user_data["dl_video_id"] = parts[1]
     edits = ctx.user_data.setdefault("dl_edits", {})
 
@@ -387,43 +422,6 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return AGUARDANDO_LINK
-
-    if action.startswith("editor_apply:"):
-        # token pode conter ":" — pegar tudo após o primeiro "editor_apply:"
-        raw_data = query.data  # ex: "dl:editor_apply:abc123"
-        token  = raw_data.replace("dl:editor_apply:", "", 1)
-        stored = ctx.user_data.get("dl_editor_token")
-        source = ctx.user_data.get("dl_editor_source")
-        if not source:
-            # Sessao expirou — tentar recuperar do banco
-            await query.answer("Processando...", show_alert=False)
-            await query.message.reply_text(
-                "\u274c Sessao do editor expirada.\n"
-                "Use /download novamente, abra o editor e clique em Aplicar logo apos salvar.")
-            return ConversationHandler.END
-        editor = await asyncio.to_thread(vc.obter_editor_result, token)
-        if not editor.get("ok"):
-            await query.message.reply_text(
-                f"\u274c Editor expirado ou token invalido.\n"
-                f"Use /download novamente e abra o editor.")
-            return ConversationHandler.END
-        editable = {k: v for k, v in editor.get("config", {}).items()
-                    if k in video_settings.DEFAULTS}
-        config = video_settings.set_values(_uid(update), editable)
-        vid_bytes, fname = source
-        await query.edit_message_text("\u23f3 Aplicando layout e processando...")
-        result = await asyncio.to_thread(
-            vc.processar_video, vid_bytes, fname, str(_uid(update)), config)
-        if result.get("ok"):
-            await query.message.reply_video(
-                video=result["video_bytes"],
-                filename=result["filename"],
-                caption=f"\u2705 Pronto! {result['size_mb']} MB")
-        else:
-            await query.message.reply_text(
-                f"\u274c Erro ao processar: {result.get('error')}")
-        ctx.user_data.clear()
-        return ConversationHandler.END
 
     if action == "processar":
         await query.edit_message_text("⏳ Processando vídeo...")
