@@ -762,8 +762,11 @@ async def _handle_usuarios(update, ctx, data: str):
         info = dict(get_all_users().get(uid, {}))
         info["is_admin"] = True
         save_user(uid, info)
+        # Recarregar e voltar para o detalhe do usuário
         name = info.get("username") or str(uid)
-        await _show(update, f"\U0001f451 @{name} agora e *Admin*!", _usuarios_keyboard())
+        await _show(update,
+            f"\U0001f451 *@{name} agora é Admin!*",
+            _usuario_detail_keyboard(uid, True))
 
     elif data.startswith("dash:usr:demote:"):
         uid  = int(data.split(":")[-1])
@@ -771,14 +774,31 @@ async def _handle_usuarios(update, ctx, data: str):
         info["is_admin"] = False
         save_user(uid, info)
         name = info.get("username") or str(uid)
-        await _show(update, f"@{name} voltou a ser *usuario comum*.", _usuarios_keyboard())
+        await _show(update,
+            f"@{name} *voltou a ser usuário comum.*",
+            _usuario_detail_keyboard(uid, False))
 
     elif data.startswith("dash:usr:remove:"):
         uid  = int(data.split(":")[-1])
         info = get_all_users().get(uid, {})
         name = info.get("username") or str(uid)
         remove_user(uid)
-        await _show(update, f"\U0001f5d1 @{name} removido.", _usuarios_keyboard())
+        # Voltar para lista após remover
+        users = get_all_users()
+        if not users:
+            await _show(update,
+                f"\U0001f5d1 @{name} removido.\n\nNenhum usuario cadastrado.",
+                _usuarios_keyboard())
+        else:
+            rows = []
+            for u, i in users.items():
+                crown = "\U0001f451 " if i.get("is_admin") else ""
+                n = i.get("username") or str(u)
+                rows.append([_button(f"{crown}@{n}", f"dash:usr:detail:{u}")])
+            rows.append([_button("Voltar", "dash:usuarios")])
+            await _show(update,
+                f"\U0001f5d1 @{name} removido.\n\n*Usuarios ({len(users)}):*",
+                InlineKeyboardMarkup(rows))
     elif data == "dash:usuarios:add":
         _prompt(ctx, "usuarios_add")
         await _show(update,
