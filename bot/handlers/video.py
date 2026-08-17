@@ -16,11 +16,15 @@ import video_settings
 logger = logging.getLogger(__name__)
 
 # Estado da conversa
-AGUARDANDO_FUNDO  = 10
-AGUARDANDO_VIDEO  = 11
-AGUARDANDO_LOTE   = 12
-AGUARDANDO_EDITOR = 13
+AGUARDANDO_FUNDO        = 10
+AGUARDANDO_VIDEO        = 11
+AGUARDANDO_LOTE         = 12
+AGUARDANDO_EDITOR       = 13
 AGUARDANDO_EDITOR_APPLY = 14
+AGUARDANDO_LINK         = 15
+AGUARDANDO_WATERMARK    = 16
+AGUARDANDO_CAPTION      = 17
+AGUARDANDO_CROP         = 18
 
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -38,6 +42,245 @@ def _account_id(update: Update) -> str:
 
 def _cfg(update: Update) -> dict:
     return video_settings.get_config(update.effective_user.id)
+
+
+# ─── /download — link Instagram ou TikTok ────────────────────
+
+@owner_only
+async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔗 *Envie o link do vídeo*\n\n"
+        "Suportado: Instagram e TikTok\n"
+        "Ex: https://www.instagram.com/reel/...\n\n"
+        "_Use /cancelar para sair._",
+        parse_mode="Markdown"
+    )
+    return AGUARDANDO_LINK
+
+
+async def receber_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg  = update.message
+    url  = msg.text.strip() if msg.text else ""
+
+    if not url.startswith("http"):
+        await msg.reply_text("❌ Envie um link válido começando com http(s)://")
+        return AGUARDANDO_LINK
+
+    await msg.reply_text("⏳ Baixando vídeo... Aguarde.")
+
+    result = await asyncio.to_thread(vc.download_link, url)
+
+    if not result.get("ok"):
+        await msg.reply_text(
+            f"❌ Falha no download:\n`{result.get('error', 'Erro desconhecido')}`",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    job_id   = result["job_id"]
+    filename = result["filename"]
+    size_mb  = result["size_mb"]
+
+    ctx.user_data["dl_job_id"]   = job_id
+    ctx.user_data["dl_filename"] = filename
+    ctx.user_data["dl_edits"]    = {}  # edições acumuladas
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎨 Mudar fundo",    callback_data="dl:fundo"),
+         InlineKeyboardButton("✂️ Cortar",         callback_data="dl:crop")],
+        [InlineKeyboardButton("💧 Marca d'água",   callback_data="dl:watermark"),
+         InlineKeyboardButton("📝 Legenda",        callback_data="dl:caption")],
+        [InlineKeyboardButton("▶️ Processar tudo", callback_data="dl:processar")],
+        [InlineKeyboardButton("❌ Cancelar",       callback_data="dl:cancelar")],
+    ])
+    await msg.reply_text(
+        f"✅ *Vídeo baixado!* ({size_mb} MB)\n"
+        f"📄 `{filename}`\n\n"
+        f"Escolha as edições ou clique em *Processar tudo*:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    return AGUARDANDO_LINK
+
+
+async def on_download_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    await query.answer()
+    action = query.data.replace("dl:", "")
+
+    job_id   = ctx.user_data.get("dl_job_id")
+    filename = ctx.user_data.get("dl_filename", "video.mp4")
+    edits    = ctx.user_data.get("dl_edits", {})
+
+    if action == "cancelar":
+        ctx.user_data.clear()
+        await query.edit_message_text("❌ Download cancelado.")
+        return ConversationHandler.END
+
+    if action == "fundo":
+        await query.edit_message_text(
+            "🎨 Fundo: use /fundo para cadastrar um fundo e ele será aplicado no processamento.\n\n"
+            "Voltando ao menu...",
+            parse_mode="Markdown"
+        )
+        await _mostrar_menu_edicao(query.message, filename, edits)
+        return AGUARDANDO_LINK
+
+    if action == "watermark":
+        ctx.user_data["dl_pending"] = "watermark"
+        await query.edit_message_text(
+            "💧 *Marca d\'água*\n\n"
+            "Digite o texto (ex: @seuusuario):\n"
+            "Ou envie /pular para não adicionar.",
+            parse_mode="Markdown"
+        )
+        return AGUARDANDO_WATERMARK
+
+    if action == "caption":
+        ctx.user_data["dl_pending"] = "caption"
+        await query.edit_message_text(
+            "📝 *Legenda*\n\n"
+            "Digite o texto que aparecerá na parte inferior:\n"
+            "Ou envie /pular para não adicionar.",
+            parse_mode="Markdown"
+        )
+        return AGUARDANDO_CAPTION
+
+    if action == "crop":
+        ctx.user_data["dl_pending"] = "crop"
+        await query.edit_message_text(
+            "✂️ *Cortar vídeo*\n\n"
+            "Digite início e fim em segundos (ex: `5-30`):\n"
+            "Ou envie /pular para não cortar.",
+            parse_mode="Markdown"
+        )
+        return AGUARDANDO_CROP
+
+    if action == "processar":
+        await query.edit_message_text("⏳ Processando vídeo com as edições selecionadas...")
+
+        # Baixar o vídeo do Railway
+        video_bytes = await asyncio.to_thread(vc.buscar_video_baixado, job_id)
+        if not video_bytes:
+            await query.message.reply_text("❌ Erro ao recuperar o vídeo. Tente novamente.")
+            return ConversationHandler.END
+
+        # Aplicar edições (marca d'água, legenda, corte)
+        watermark = edits.get("watermark", "")
+        caption   = edits.get("caption", "")
+        crop_s    = edits.get("crop_start", 0.0)
+        crop_e    = edits.get("crop_end", 0.0)
+
+        needs_edit = any([watermark, caption, crop_s, crop_e])
+
+        if needs_edit:
+            result = await asyncio.to_thread(
+                vc.editar_video,
+                video_bytes, filename,
+                watermark, caption, crop_s, crop_e
+            )
+        else:
+            # Só processamento de fundo (já existente)
+            result = await asyncio.to_thread(
+                vc.processar_video,
+                video_bytes, filename,
+                _account_id(update), _cfg(update)
+            )
+
+        if result.get("ok"):
+            await query.message.reply_video(
+                video=result["video_bytes"],
+                filename=result["filename"],
+                caption=f"✅ *Vídeo pronto!* {result['size_mb']} MB",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.message.reply_text(
+                f"❌ Erro: `{result.get('error')}`",
+                parse_mode="Markdown"
+            )
+
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    return AGUARDANDO_LINK
+
+
+async def _mostrar_menu_edicao(msg, filename, edits):
+    badges = {
+        "watermark": "💧✅" if edits.get("watermark") else "💧",
+        "caption":   "📝✅" if edits.get("caption")   else "📝",
+        "crop":      "✂️✅" if edits.get("crop_start") else "✂️",
+    }
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎨 Mudar fundo",              callback_data="dl:fundo"),
+         InlineKeyboardButton(f"{badges['crop']} Cortar",    callback_data="dl:crop")],
+        [InlineKeyboardButton(f"{badges['watermark']} Marca d\'água", callback_data="dl:watermark"),
+         InlineKeyboardButton(f"{badges['caption']} Legenda", callback_data="dl:caption")],
+        [InlineKeyboardButton("▶️ Processar tudo", callback_data="dl:processar")],
+        [InlineKeyboardButton("❌ Cancelar",       callback_data="dl:cancelar")],
+    ])
+    await msg.reply_text(
+        f"📄 `{filename}`\nEscolha as edições:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+
+async def receber_watermark(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+    if text and text != "/pular":
+        ctx.user_data.setdefault("dl_edits", {})["watermark"] = text
+    await update.message.reply_text(
+        f"✅ Marca d'água: `{text}`" if text and text != "/pular" else "⏭ Sem marca d'água.",
+        parse_mode="Markdown"
+    )
+    await _mostrar_menu_edicao(
+        update.message,
+        ctx.user_data.get("dl_filename", "video.mp4"),
+        ctx.user_data.get("dl_edits", {})
+    )
+    return AGUARDANDO_LINK
+
+
+async def receber_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+    if text and text != "/pular":
+        ctx.user_data.setdefault("dl_edits", {})["caption"] = text
+    await update.message.reply_text(
+        f"✅ Legenda: `{text}`" if text and text != "/pular" else "⏭ Sem legenda.",
+        parse_mode="Markdown"
+    )
+    await _mostrar_menu_edicao(
+        update.message,
+        ctx.user_data.get("dl_filename", "video.mp4"),
+        ctx.user_data.get("dl_edits", {})
+    )
+    return AGUARDANDO_LINK
+
+
+async def receber_crop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+    if text and text != "/pular" and "-" in text:
+        try:
+            parts = text.split("-")
+            s = float(parts[0])
+            e = float(parts[1])
+            edits = ctx.user_data.setdefault("dl_edits", {})
+            edits["crop_start"] = s
+            edits["crop_end"]   = e
+            await update.message.reply_text(f"✅ Corte: `{s}s` até `{e}s`", parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text("❌ Formato inválido. Use: `5-30`", parse_mode="Markdown")
+            return AGUARDANDO_CROP
+    else:
+        await update.message.reply_text("⏭ Sem corte.")
+    await _mostrar_menu_edicao(
+        update.message,
+        ctx.user_data.get("dl_filename", "video.mp4"),
+        ctx.user_data.get("dl_edits", {})
+    )
+    return AGUARDANDO_LINK
 
 
 # ─── /fundo ──────────────────────────────────────────────────
@@ -494,6 +737,29 @@ def register_video_handlers(app):
             AGUARDANDO_LOTE: [
                 MessageHandler(filters.VIDEO | filters.Document.VIDEO, coletar_lote),
                 CommandHandler("processar_lote", executar_lote),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_user=True,
+        per_message=False,
+    ))
+
+    # Conversa /download
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("download", cmd_download)],
+        states={
+            AGUARDANDO_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receber_link),
+                CallbackQueryHandler(on_download_action, pattern=r"^dl:"),
+            ],
+            AGUARDANDO_WATERMARK: [
+                MessageHandler(filters.TEXT, receber_watermark),
+            ],
+            AGUARDANDO_CAPTION: [
+                MessageHandler(filters.TEXT, receber_caption),
+            ],
+            AGUARDANDO_CROP: [
+                MessageHandler(filters.TEXT, receber_crop),
             ],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
