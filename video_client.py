@@ -230,3 +230,70 @@ def limpar_tmp() -> dict:
         return {"ok": False, "error": _response_error(response)}
     except Exception as exc:
         return _error(exc)
+
+
+def download_link(url: str) -> dict:
+    """Solicita download de vídeo do Instagram ou TikTok."""
+    try:
+        _check_configured()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.post(
+                f"{VIDEO_API_URL}/api/v1/download",
+                headers=HEADERS,
+                json={"url": url},
+            )
+        if response.is_success:
+            return response.json()
+        return {"ok": False, "error": _response_error(response)}
+    except Exception as exc:
+        return _error(exc)
+
+
+def buscar_video_baixado(job_id: str) -> bytes | None:
+    """Baixa o vídeo já processado pelo job_id."""
+    try:
+        _check_configured()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.get(
+                f"{VIDEO_API_URL}/api/v1/download/{job_id}",
+                headers=HEADERS,
+            )
+        return response.content if response.is_success else None
+    except Exception:
+        return None
+
+
+def editar_video(
+    video_bytes: bytes,
+    filename: str,
+    watermark_text: str = "",
+    caption_text: str = "",
+    crop_start: float = 0.0,
+    crop_end: float = 0.0,
+) -> dict:
+    """Aplica marca d'água, legenda e/ou corte ao vídeo."""
+    try:
+        _check_configured()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.post(
+                f"{VIDEO_API_URL}/api/v1/editar",
+                headers=HEADERS,
+                files={"video": (filename, video_bytes, "video/mp4")},
+                data={
+                    "watermark_text": watermark_text,
+                    "caption_text": caption_text,
+                    "crop_start": str(crop_start),
+                    "crop_end": str(crop_end),
+                },
+            )
+        if not response.is_success:
+            return {"ok": False, "error": _response_error(response)}
+        size_mb = round(len(response.content) / (1024 * 1024), 2)
+        return {
+            "ok": True,
+            "video_bytes": response.content,
+            "filename": f"editado_{filename}",
+            "size_mb": size_mb,
+        }
+    except Exception as exc:
+        return _error(exc)
