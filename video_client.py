@@ -233,7 +233,7 @@ def limpar_tmp() -> dict:
 
 
 def download_link(url: str) -> dict:
-    """Solicita download de vídeo do Instagram ou TikTok."""
+    """Baixa video do Instagram/TikTok e retorna os bytes diretamente."""
     try:
         _check_configured()
         with httpx.Client(timeout=TIMEOUT) as client:
@@ -242,9 +242,16 @@ def download_link(url: str) -> dict:
                 headers=HEADERS,
                 json={"url": url},
             )
-        if response.is_success:
-            return response.json()
-        return {"ok": False, "error": _response_error(response)}
+        if not response.is_success:
+            return {"ok": False, "error": _response_error(response)}
+        filename = response.headers.get("X-Filename", "video.mp4")
+        size_mb  = float(response.headers.get("X-Size-MB", "0"))
+        return {
+            "ok":          True,
+            "video_bytes": response.content,
+            "filename":    filename,
+            "size_mb":     size_mb,
+        }
     except Exception as exc:
         return _error(exc)
 
