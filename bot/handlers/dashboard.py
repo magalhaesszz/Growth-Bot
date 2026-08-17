@@ -1111,7 +1111,14 @@ async def on_dashboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             accounts_db.update_settings(acc["username"], {"unfollow_policy": policy})
             await _show(update, "Regra de unfollow atualizada.\n\n" + _config_text(ctx), _config_keyboard())
         elif data == "dash:video":
-            await _show(update, _video_home_text(), _video_keyboard())
+            await _show(update,
+                "*Editor de Video*\n\n"
+                "Use os comandos abaixo para editar vídeos:\n\n"
+                "/download — Baixar do Instagram/TikTok\n"
+                "/video — Enviar arquivo MP4\n"
+                "/video_lote — Processar vários vídeos\n"
+                "/video_status — Status da API",
+                InlineKeyboardMarkup([[_button("Voltar", "dash:home")]]))
         elif data == "dash:video:status":
             status = await asyncio.to_thread(vc.api_status)
             await _show(update, _video_status_text(status), _video_keyboard())
