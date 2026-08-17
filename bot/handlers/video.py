@@ -351,6 +351,10 @@ async def _processar(update, ctx) -> dict:
         vid_bytes = result["video_bytes"]
         fname     = result["filename"]
 
+    # Verificar se há fundo salvo no banco — se sim, enviar para a API
+    fundo_bytes = await asyncio.to_thread(vdb.get_fundo, _uid(update))
+    if fundo_bytes:
+        await asyncio.to_thread(vc.salvar_fundo, fundo_bytes, "fundo.png", str(_uid(update)))
     return await asyncio.to_thread(
         vc.processar_video, vid_bytes, fname, str(_uid(update)), _cfg(update))
 
@@ -380,13 +384,19 @@ async def receber_fundo_dl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fb = bytes(await file_obj.download_as_bytearray())
     fn = getattr(msg.document,"file_name","fundo.png") if msg.document else "fundo.png"
 
-    result = await asyncio.to_thread(vc.salvar_fundo, fb, fn, str(_uid(update)))
-    if result.get("ok"):
+    # Salvar no Supabase Storage (substitui o anterior)
+    sp = await asyncio.to_thread(vdb.save_fundo, _uid(update), fb, fn)
+    if sp:
         edits["fundo"] = True
-        await msg.reply_text("✅ Fundo salvo!",
-            reply_markup=_menu_edicao_kb(edits, vid_id))
+        # Também enviar para a Video API (para o processamento de fundo)
+        await asyncio.to_thread(vc.salvar_fundo, fb, fn, str(_uid(update)))
+        await msg.reply_text(
+            "✅ *Fundo salvo na biblioteca!*\nSerá aplicado ao processar.",
+            reply_markup=_menu_edicao_kb(edits, vid_id),
+            parse_mode="Markdown")
     else:
-        await msg.reply_text(f"❌ {result.get('error')}",
+        await msg.reply_text(
+            "❌ Erro ao salvar fundo. Tente novamente.",
             reply_markup=_menu_edicao_kb(edits, vid_id))
     return AGUARDANDO_LINK
 
@@ -437,6 +447,61 @@ async def receber_crop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── /video_lote ─────────────────────────────────────────────
+
+
+@owner_only
+async def cmd_fundo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Mostra o fundo atual ou pede para enviar um novo."""
+    info = await asyncio.to_thread(vdb.get_fundo_info, _uid(update))
+    if info:
+        fundo_bytes = await asyncio.to_thread(vdb.get_fundo, _uid(update))
+        if fundo_bytes:
+            await update.message.reply_photo(
+                photo=fundo_bytes,
+                caption=(
+                    f"🎨 *Fundo atual:* `{info['filename']}`\n\n"
+                    f"Para trocar, envie uma nova imagem abaixo:"
+                ),
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "🎨 Nenhum fundo encontrado no banco.\nEnvie uma imagem PNG/JPG 1080x1920px:")
+    else:
+        await update.message.reply_text(
+            "🎨 *Cadastrar fundo de vídeo*\n\n"
+            "Envie uma imagem PNG/JPG (ideal 1080x1920px):",
+            parse_mode="Markdown"
+        )
+    return AGUARDANDO_FUNDO
+
+
+async def receber_fundo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg   = update.message
+    photo = msg.photo or (
+        msg.document if msg.document and
+        msg.document.mime_type and
+        msg.document.mime_type.startswith("image") else None)
+    if not photo:
+        await msg.reply_text("❌ Envie uma imagem PNG ou JPG.")
+        return AGUARDANDO_FUNDO
+
+    file_obj = await (photo[-1] if isinstance(photo,list) else photo).get_file()
+    fb = bytes(await file_obj.download_as_bytearray())
+    fn = getattr(msg.document,"file_name","fundo.png") if msg.document else "fundo.png"
+
+    sp = await asyncio.to_thread(vdb.save_fundo, _uid(update), fb, fn)
+    if sp:
+        await asyncio.to_thread(vc.salvar_fundo, fb, fn, str(_uid(update)))
+        await msg.reply_text(
+            "✅ *Fundo salvo e atualizado no banco!*\n"
+            "Será aplicado automaticamente em todos os próximos processamentos.",
+            parse_mode="Markdown"
+        )
+    else:
+        await msg.reply_text("❌ Erro ao salvar fundo. Tente novamente.")
+    return ConversationHandler.END
+
 
 @owner_only
 async def cmd_video_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -593,6 +658,16 @@ def register_video_handlers(app):
         states={AGUARDANDO_LOTE: [
             MessageHandler(filters.VIDEO | filters.Document.VIDEO, coletar_lote),
             CommandHandler("processar_lote", executar_lote),
+        ]},
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_user=True, per_message=False,
+    ))
+
+    # Conversa /fundo — cadastrar/trocar fundo
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("fundo", cmd_fundo)],
+        states={AGUARDANDO_FUNDO: [
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, receber_fundo_cmd),
         ]},
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_user=True, per_message=False,
