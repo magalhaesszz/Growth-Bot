@@ -23,6 +23,8 @@ AGUARDANDO_WATERMARK = 16
 AGUARDANDO_CAPTION   = 17
 AGUARDANDO_CROP      = 18
 AGUARDANDO_FUNDO_DL  = 19
+AGUARDANDO_SPEED     = 20
+AGUARDANDO_FLIP      = 21
 
 
 def owner_only(func):
@@ -47,19 +49,26 @@ def _cfg(update: Update) -> dict:
 
 
 def _menu_edicao_kb(edits: dict, video_id: str = "") -> InlineKeyboardMarkup:
-    wm  = "💧✅" if edits.get("watermark") else "💧"
-    cap = "📝✅" if edits.get("caption")   else "📝"
-    cr  = "✂️✅" if edits.get("crop_start") else "✂️"
-    fd  = "🎨✅" if edits.get("fundo")      else "🎨"
+    wm  = "\U0001f4a7\u2705" if edits.get("watermark") else "\U0001f4a7"
+    cap = "\U0001f4dd\u2705" if edits.get("caption")   else "\U0001f4dd"
+    cr  = "\u2702\ufe0f\u2705" if edits.get("crop_start") else "\u2702\ufe0f"
+    fd  = "\U0001f3a8\u2705" if edits.get("fundo")    else "\U0001f3a8"
     suffix = f":{video_id}" if video_id else ""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{fd} Fundo",        callback_data=f"dl:fundo{suffix}"),
-         InlineKeyboardButton(f"{cr} Cortar",       callback_data=f"dl:crop{suffix}")],
-        [InlineKeyboardButton(f"{wm} Marca d'água", callback_data=f"dl:watermark{suffix}"),
-         InlineKeyboardButton(f"{cap} Legenda",     callback_data=f"dl:caption{suffix}")],
-        [InlineKeyboardButton("▶️ Processar",       callback_data=f"dl:processar{suffix}")],
-        [InlineKeyboardButton("🗂 Minha biblioteca", callback_data="dl:biblioteca"),
-         InlineKeyboardButton("❌ Cancelar",        callback_data="dl:cancelar")],
+        # Linha 1: Fundo e Cortar
+        [InlineKeyboardButton(f"{fd} Fundo",          callback_data=f"dl:fundo{suffix}"),
+         InlineKeyboardButton(f"{cr} Cortar",         callback_data=f"dl:crop{suffix}")],
+        # Linha 2: Marca dagua e Legenda
+        [InlineKeyboardButton(f"{wm} Marca d'agua",   callback_data=f"dl:watermark{suffix}"),
+         InlineKeyboardButton(f"{cap} Legenda",       callback_data=f"dl:caption{suffix}")],
+        # Linha 3: Velocidade e Flip
+        [InlineKeyboardButton("\u23e9 Velocidade",    callback_data=f"dl:speed{suffix}"),
+         InlineKeyboardButton("\U0001f503 Espelhar",  callback_data=f"dl:flip{suffix}")],
+        # Linha 4: Processar
+        [InlineKeyboardButton("\u25b6\ufe0f Processar", callback_data=f"dl:processar{suffix}")],
+        # Linha 5: Biblioteca e Cancelar
+        [InlineKeyboardButton("\U0001f5c2 Biblioteca", callback_data="dl:biblioteca"),
+         InlineKeyboardButton("\u274c Cancelar",      callback_data="dl:cancelar")],
     ])
 
 
@@ -365,13 +374,16 @@ async def _processar(update, ctx) -> dict:
     if not vid_bytes:
         return {"ok": False, "error": "Não foi possível recuperar o vídeo do banco."}
 
-    wm, cap  = edits.get("watermark",""), edits.get("caption","")
-    crop_s   = edits.get("crop_start", 0.0)
-    crop_e   = edits.get("crop_end", 0.0)
+    wm     = edits.get("watermark", "")
+    cap    = edits.get("caption", "")
+    crop_s = edits.get("crop_start", 0.0)
+    crop_e = edits.get("crop_end", 0.0)
+    speed  = edits.get("speed", 0.0)
+    flip   = edits.get("flip", False)
 
-    if wm or cap or crop_s or crop_e:
+    if wm or cap or crop_s or crop_e or speed or flip:
         result = await asyncio.to_thread(
-            vc.editar_video, vid_bytes, fname, wm, cap, crop_s, crop_e)
+            vc.editar_video, vid_bytes, fname, wm, cap, crop_s, crop_e, speed, flip)
         if not result.get("ok"):
             return result
         vid_bytes = result["video_bytes"]
@@ -450,6 +462,30 @@ async def receber_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=_menu_edicao_kb(edits, vid_id), parse_mode="Markdown")
     return AGUARDANDO_LINK
 
+
+
+async def receber_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text  = (update.message.text or "").strip()
+    edits = ctx.user_data.setdefault("dl_edits", {})
+    vid_id = ctx.user_data.get("dl_video_id","")
+    if text and text != "/pular":
+        try:
+            speed = float(text)
+            if 0.25 <= speed <= 4.0:
+                edits["speed"] = speed
+                await update.message.reply_text(
+                    f"\u2705 Velocidade: `{speed}x`",
+                    reply_markup=_menu_edicao_kb(edits, vid_id), parse_mode="Markdown")
+            else:
+                await update.message.reply_text("\u274c Use valor entre 0.25 e 4.0")
+                return AGUARDANDO_SPEED
+        except ValueError:
+            await update.message.reply_text("\u274c Digite um numero. Ex: `1.5`", parse_mode="Markdown")
+            return AGUARDANDO_SPEED
+    else:
+        await update.message.reply_text("\u23ed Velocidade normal.",
+            reply_markup=_menu_edicao_kb(edits, vid_id))
+    return AGUARDANDO_LINK
 
 async def receber_crop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = (update.message.text or "").strip()
