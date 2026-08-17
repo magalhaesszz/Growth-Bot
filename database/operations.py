@@ -202,6 +202,56 @@ class DB:
         )
         return res.data or []
 
+
+    def get_following_list(self, account_id, limit: int = 200) -> list[dict]:
+        """Lista todos os seguidos pelo bot, do mais recente ao mais antigo."""
+        res = (
+            self.sb.table("ig_followed")
+            .select("target_username, target_user_id, followed_at, follows_back, status")
+            .eq("account_id", account_id)
+            .eq("status", "following")
+            .order("followed_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+
+    def get_non_followers(self, account_id, limit: int = 0) -> list[dict]:
+        """Retorna seguidos que NAO seguem de volta, do mais recente."""
+        q = (
+            self.sb.table("ig_followed")
+            .select("target_username, target_user_id, followed_at, follows_back")
+            .eq("account_id", account_id)
+            .eq("status", "following")
+            .eq("follows_back", False)
+            .order("followed_at", desc=True)
+        )
+        if limit > 0:
+            q = q.limit(limit)
+        return q.execute().data or []
+
+    def unfollow_user_by_username(self, account_id, username: str):
+        """Marca usuario como unfollowed no banco."""
+        self.sb.table("ig_followed").update({
+            "status": "unfollowed",
+            "unfollowed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("account_id", account_id).eq("target_username", username).execute()
+
+    def check_and_mark_follow_back(self, account_id, user_id: str, username: str) -> bool:
+        """Checa se usuario segue de volta e atualiza banco. Retorna True se segue."""
+        res = (
+            self.sb.table("ig_followed")
+            .select("follows_back")
+            .eq("account_id", account_id)
+            .eq("target_user_id", user_id)
+            .eq("status", "following")
+            .execute()
+        )
+        if not res.data:
+            return False
+        current = res.data[0].get("follows_back", False)
+        return current
+
     def get_stats_today(self, account_id) -> dict:
         today = datetime.now(timezone.utc).date().isoformat()
         logs = (
