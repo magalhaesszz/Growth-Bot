@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS ig_action_logs (
     executed_at     TIMESTAMPTZ DEFAULT now()
 );
 
+-- Log de auditoria de acoes administrativas
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          BIGSERIAL PRIMARY KEY,
+    actor_id    BIGINT NOT NULL,
+    actor_username TEXT DEFAULT '?',
+    action      TEXT NOT NULL,
+    target      TEXT DEFAULT '',
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+
 -- Usuarios autorizados no bot Telegram
 CREATE TABLE IF NOT EXISTS bot_users (
     user_id     BIGINT PRIMARY KEY,
