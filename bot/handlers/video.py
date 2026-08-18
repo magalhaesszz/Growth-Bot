@@ -705,22 +705,43 @@ async def receber_fundo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cmd_fundos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Lista todos os fundos salvos e permite escolher qual usar."""
+    """Lista todos os fundos salvos com miniatura e permite escolher/remover."""
     fundos = await asyncio.to_thread(vdb.list_fundos, _uid(update))
     if not fundos:
         await update.message.reply_text(
             "Nenhum fundo salvo ainda. Use /fundo para cadastrar o primeiro.")
         return
-    rows = [
-        [InlineKeyboardButton(f"🎨 {f['nome']}", callback_data=f"fnd:use:{f['slug']}")]
-        for f in fundos[:5]
-    ]
-    rows.append([InlineKeyboardButton("➕ Adicionar novo", callback_data="fnd:add")])
-    await update.message.reply_text(
-        f"*Seus fundos ({len(fundos)}/5):*\n\nToque para usar como ativo:",
-        reply_markup=InlineKeyboardMarkup(rows),
-        parse_mode="Markdown"
-    )
+
+    ativo_info = await asyncio.to_thread(vdb.get_fundo_info, _uid(update))
+    ativo_path = ativo_info.get("storage_path") if ativo_info else None
+
+    # Enviar cada fundo como miniatura individual com botoes de acao
+    for f in fundos[:5]:
+        img_bytes = await asyncio.to_thread(vdb.download_video, f["storage_path"])
+        marcador = " ✅ (ativo)" if f["storage_path"] == ativo_path else ""
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Usar este", callback_data=f"fnd:use:{f['slug']}"),
+             InlineKeyboardButton("🗑 Remover", callback_data=f"fnd:del_confirm:{f['slug']}")],
+        ])
+        if img_bytes:
+            await update.message.reply_photo(
+                photo=img_bytes,
+                caption=f"*{f['nome']}*{marcador}",
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"*{f['nome']}*{marcador}",
+                reply_markup=kb, parse_mode="Markdown")
+
+    if len(fundos) < 5:
+        await update.message.reply_text(
+            f"({len(fundos)}/5 fundos)",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ Adicionar novo", callback_data="fnd:add")
+            ]]))
+    else:
+        await update.message.reply_text("Limite de 5 fundos atingido.")
 
 
 async def on_fundo_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
