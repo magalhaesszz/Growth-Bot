@@ -488,10 +488,31 @@ async def _processar(update, ctx) -> dict:
         vid_bytes = result["video_bytes"]
         fname     = result["filename"]
 
-    # Verificar se há fundo salvo no banco — se sim, enviar para a API
-    fundo_bytes = await asyncio.to_thread(vdb.get_fundo, _uid(update))
-    if fundo_bytes:
-        await asyncio.to_thread(vc.salvar_fundo, fundo_bytes, "fundo.png", str(_uid(update)))
+    # Garantir que o fundo do usuario esta sincronizado com a Video API
+    try:
+        fundo_bytes = await asyncio.to_thread(vdb.get_fundo, _uid(update))
+    except Exception as e:
+        logger.warning(f"Erro ao buscar fundo do banco: {e}")
+        fundo_bytes = None
+
+    if not fundo_bytes:
+        return {
+            "ok": False,
+            "error": (
+                "Voce ainda nao tem um fundo cadastrado.\n"
+                "Use o botao \U0001f3a8 Fundo no menu ou /fundo para cadastrar uma imagem "
+                "antes de processar."
+            ),
+        }
+
+    try:
+        sync = await asyncio.to_thread(
+            vc.salvar_fundo, fundo_bytes, "fundo.png", str(_uid(update)))
+        if not sync.get("ok"):
+            logger.warning(f"Falha ao sincronizar fundo com a API: {sync.get('error')}")
+    except Exception as e:
+        logger.warning(f"Erro ao sincronizar fundo: {e}")
+
     return await asyncio.to_thread(
         vc.processar_video, vid_bytes, fname, str(_uid(update)), _cfg(update))
 
