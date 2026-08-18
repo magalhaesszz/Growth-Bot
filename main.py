@@ -40,6 +40,8 @@ async def post_init(app: Application):
     scheduler = setup_scheduler(telegram_app=app)
     scheduler.start()
     logger.info("Agendador iniciado.")
+    from scheduler.jobs import resume_manual_mode_if_needed
+    await resume_manual_mode_if_needed(telegram_app=app)
 
 
 async def on_error(update: object, context):
