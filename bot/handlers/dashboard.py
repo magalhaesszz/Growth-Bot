@@ -46,18 +46,22 @@ def _button(text: str, data: str) -> InlineKeyboardButton:
 
 def _main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [_button("Status", "dash:status"), _button("Contas", "dash:accounts")],
-        [_button("Alvos", "dash:targets"), _button("Campanhas", "dash:campaigns")],
-        [_button("Config", "dash:config"), _button("Listas", "dash:lists")],
-        [_button("Fila", "dash:queue"), _button("Logs", "dash:logs")],
-        [_button("Relatorio", "dash:report"), _button("Seguranca", "dash:safety")],
-        [_button("Pausar tudo", "dash:pause_all"), _button("Retomar tudo", "dash:resume_all")],
-        [_button("Rodar agora", "dash:manual_start"), _button("Parar", "dash:manual_stop")],
-        [_button("Limpar nao-seguidores", "dash:unfollow_naobot")],
-        [_button("Editor de Video", "dash:video")],
-        [_button("Usuarios", "dash:usuarios")],
-        [_button("Configuracoes", "dash:config_conta")],
-        [_button("Atualizar", "dash:home")],
+        # ── Visao geral ──────────────────────────────
+        [_button("📊 Status", "dash:status"), _button("📱 Contas", "dash:accounts")],
+        [_button("🎯 Alvos", "dash:targets"), _button("🚀 Campanhas", "dash:campaigns")],
+        # ── Operacao ──────────────────────────────────
+        [_button("▶️ Rodar agora", "dash:manual_start"), _button("⏹ Parar", "dash:manual_stop")],
+        [_button("⏸ Pausar tudo", "dash:pause_all"), _button("▶ Retomar tudo", "dash:resume_all")],
+        [_button("🧹 Limpar não-seguidores", "dash:unfollow_naobot")],
+        # ── Configuracao ──────────────────────────────
+        [_button("⚙️ Config conta", "dash:config_conta"), _button("📋 Listas", "dash:lists")],
+        [_button("🗂 Fila", "dash:queue"), _button("📜 Logs", "dash:logs")],
+        [_button("📈 Relatório", "dash:report"), _button("🛡 Segurança", "dash:safety")],
+        # ── Ferramentas ────────────────────────────────
+        [_button("🎬 Editor de Vídeo", "dash:video")],
+        # ── Administração ──────────────────────────────
+        [_button("👥 Usuários", "dash:usuarios")],
+        [_button("🔄 Atualizar", "dash:home")],
     ])
 
 
