@@ -346,6 +346,26 @@ async def run_manual_mode():
     logger.info("Modo manual encerrado.")
 
 
+def _persist_manual_state(ativo: bool):
+    """Salva o estado do modo manual no banco — sobrevive a restart."""
+    try:
+        from database.operations import DB
+        DB().sb.table("bot_state").upsert({
+            "key": "manual_mode", "value": "true" if ativo else "false"
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Erro ao persistir estado do modo manual: {e}")
+
+
+def _read_manual_state() -> bool:
+    try:
+        from database.operations import DB
+        res = DB().sb.table("bot_state").select("value").eq("key", "manual_mode").execute()
+        return bool(res.data and res.data[0]["value"] == "true")
+    except Exception:
+        return False
+
+
 async def start_manual_mode(telegram_app=None) -> bool:
     """Liga o modo manual. Retorna False se já estiver rodando."""
     global _MANUAL_MODE, _MANUAL_TASK, _telegram_app
@@ -354,6 +374,7 @@ async def start_manual_mode(telegram_app=None) -> bool:
     if telegram_app:
         _telegram_app = telegram_app
     _MANUAL_MODE = True
+    _persist_manual_state(True)
     import asyncio
     _MANUAL_TASK = asyncio.create_task(run_manual_mode())
     return True
@@ -365,10 +386,27 @@ async def stop_manual_mode() -> bool:
     if not _MANUAL_MODE:
         return False
     _MANUAL_MODE = False
+    _persist_manual_state(False)
     if _MANUAL_TASK and not _MANUAL_TASK.done():
         _MANUAL_TASK.cancel()
     _MANUAL_TASK = None
     return True
+
+
+async def resume_manual_mode_if_needed(telegram_app=None):
+    """Chamado no startup — retoma o modo manual se estava ativo antes do restart."""
+    if _read_manual_state():
+        logger.info("Modo manual estava ativo antes do restart — retomando...")
+        await start_manual_mode(telegram_app)
+        if _telegram_app:
+            try:
+                await _notify(
+                    "🔄 *Modo manual retomado automaticamente*\n\n"
+                    "O bot reiniciou e detectou que o modo manual estava ativo. "
+                    "Continuando de onde parou."
+                )
+            except Exception:
+                pass
 
 
 def is_manual_mode() -> bool:
