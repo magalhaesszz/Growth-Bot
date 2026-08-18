@@ -765,10 +765,24 @@ async def on_fundo_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Erro ao ativar fundo.")
         return ConversationHandler.END
 
+    if data.startswith("del_confirm:"):
+        slug = data.replace("del_confirm:", "")
+        await query.edit_message_reply_markup(
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Sim, remover", callback_data=f"fnd:del:{slug}"),
+                 InlineKeyboardButton("❌ Cancelar", callback_data="fnd:noop")],
+            ])
+        )
+        return ConversationHandler.END
+
+    if data == "noop":
+        return ConversationHandler.END
+
     if data.startswith("del:"):
         slug = data.replace("del:", "")
         await asyncio.to_thread(vdb.delete_fundo_named, _uid(update), slug)
-        await query.edit_message_text("🗑 Fundo removido.")
+        await query.edit_message_caption(caption="🗑 Fundo removido.") if query.message.caption \
+            else await query.edit_message_text("🗑 Fundo removido.")
         return ConversationHandler.END
 
 
