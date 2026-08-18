@@ -139,6 +139,29 @@ class RiskDetector:
                 except Exception as e:
                     logger.warning(f"Falha ao notificar pausa de risco: {e}")
 
+    def notify_session_expired(self, username: str):
+        """Notifica que a sessao expirou e pausa a conta ate reconectar."""
+        state = self._state(username)
+        if not state.is_paused:
+            state.is_paused = True
+            state.pause_reason = "Sessão expirada"
+            logger.error(f"[{username}] SESSAO EXPIRADA — conta pausada.")
+            if self._notify_fn:
+                try:
+                    import asyncio
+                    msg = (
+                        f"🔒 *Sessão expirada — @{username}*\n\n"
+                        f"O Instagram desconectou a conta.\n"
+                        f"Use `/conta_sessao @{username} SESSIONID` para reconectar."
+                    )
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(self._notify_fn(msg), loop)
+                    else:
+                        asyncio.run(self._notify_fn(msg))
+                except Exception as e:
+                    logger.warning(f"Falha ao notificar sessao expirada: {e}")
+
     def resume(self, username: str):
         state = self._state(username)
         state.is_paused = False
