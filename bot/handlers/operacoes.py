@@ -545,9 +545,19 @@ async def cmd_nao_seguem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try: limite = int(ctx.args[0])
         except Exception: pass
     db   = DB()
-    rows = db.get_non_followers(acc["id"], limit=limite)
+    rows = db.get_non_followers(acc["id"], limit=0)
+
+    whitelist = {w.lower() for w in db.get_whitelist(acc["id"])}
+    protegidos = [r for r in rows if r["target_username"].lower() in whitelist]
+    rows = [r for r in rows if r["target_username"].lower() not in whitelist]
+    if limite > 0:
+        rows = rows[:limite]
+
     if not rows:
-        await update.message.reply_text("\u2705 Todos seguem de volta!")
+        msg = "\u2705 Todos seguem de volta!"
+        if protegidos:
+            msg += f"\n({len(protegidos)} na whitelist foram ignorados)"
+        await update.message.reply_text(msg)
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     n = len(rows)
@@ -557,6 +567,8 @@ async def cmd_nao_seguem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\u2022 @{r['target_username']} \u2014 {date}")
     if n > 20:
         lines.append(f"_... e mais {n-20}_")
+    if protegidos:
+        lines.append(f"\n_{len(protegidos)} protegido(s) pela whitelist_")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"\U0001f5d1 Deixar de seguir todos ({n})",
