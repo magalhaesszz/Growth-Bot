@@ -336,10 +336,19 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AGUARDANDO_LINK
 
     if action == "fundo":
-        await query.edit_message_text(
-            "🎨 *Envie a imagem de fundo*\n\nPNG ou JPG, ideal 1080x1920px.\n"
-            "Ou envie /pular para continuar sem fundo.",
-            parse_mode="Markdown")
+        info = await asyncio.to_thread(vdb.get_fundo_info, _uid(update))
+        if info:
+            fname_atual = info.get("filename", "fundo.png")
+            await query.edit_message_text(
+                f"🎨 *Você já tem um fundo cadastrado:* `{fname_atual}`\n\n"
+                f"Ele será usado automaticamente.\n"
+                f"Envie uma nova imagem para trocar, ou /pular para manter o atual.",
+                parse_mode="Markdown")
+        else:
+            await query.edit_message_text(
+                "🎨 *Envie a imagem de fundo*\n\nPNG ou JPG, ideal 1080x1920px.\n"
+                "Será salva e usada automaticamente em todos os próximos vídeos.",
+                parse_mode="Markdown")
         return AGUARDANDO_FUNDO_DL
 
     if action == "watermark":
@@ -526,8 +535,14 @@ async def receber_fundo_dl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vid_id = ctx.user_data.get("dl_video_id","")
 
     if text == "/pular":
-        await msg.reply_text("⏭ Sem fundo.",
-            reply_markup=_menu_edicao_kb(edits, vid_id))
+        info = await asyncio.to_thread(vdb.get_fundo_info, _uid(update))
+        if info:
+            edits["fundo"] = True
+            await msg.reply_text("✅ Mantendo fundo já cadastrado.",
+                reply_markup=_menu_edicao_kb(edits, vid_id))
+        else:
+            await msg.reply_text("⏭ Sem fundo.",
+                reply_markup=_menu_edicao_kb(edits, vid_id))
         return AGUARDANDO_LINK
 
     photo = msg.photo or (
