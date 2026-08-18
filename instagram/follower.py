@@ -92,6 +92,14 @@ class Follower:
 
             except Exception as e:
                 results["errors"] += 1
+                err_str = str(e).lower()
+
+                # Sessao expirada / logout forcado pelo Instagram
+                if any(k in err_str for k in ("login_required", "loginrequired", "sessionid")):
+                    self.risk.notify_session_expired(self.username)
+                    results["errors"] += 1
+                    break  # para o batch — sessao invalida, sem sentido continuar
+
                 self.risk.record_error(self.username, e)
                 logger.error(f"[{self.username}] Erro ao seguir @{uname}: {e}")
 
