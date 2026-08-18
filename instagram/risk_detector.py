@@ -33,6 +33,11 @@ class RiskDetector:
 
     def __init__(self):
         self._states: dict[str, RiskState] = {}
+        self._notify_fn = None  # callback async(mensagem) para alertar via Telegram
+
+    def set_notify_fn(self, fn):
+        """Define a funcao de notificacao (chamada quando uma conta e pausada)."""
+        self._notify_fn = fn
 
     def _state(self, username: str) -> RiskState:
         if username not in self._states:
@@ -122,6 +127,17 @@ class RiskDetector:
             state.is_paused = True
             state.pause_reason = reason
             logger.error(f"[{username}] CONTA PAUSADA — {reason}")
+            if self._notify_fn:
+                try:
+                    import asyncio
+                    msg = f"🚨 *Conta pausada automaticamente*\n\n@{username}\nMotivo: {reason}"
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(self._notify_fn(msg), loop)
+                    else:
+                        asyncio.run(self._notify_fn(msg))
+                except Exception as e:
+                    logger.warning(f"Falha ao notificar pausa de risco: {e}")
 
     def resume(self, username: str):
         state = self._state(username)
