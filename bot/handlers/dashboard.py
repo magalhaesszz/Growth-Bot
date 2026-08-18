@@ -801,6 +801,7 @@ async def _handle_usuarios(update, ctx, data: str):
         info["is_admin"] = False
         save_user(uid, info)
         name = info.get("username") or str(uid)
+        _audit("demote_admin", f"{name} ({uid})")
         await _show(update,
             f"@{name} *voltou a ser usuário comum.*",
             _usuario_detail_keyboard(uid, False))
