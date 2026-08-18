@@ -312,6 +312,28 @@ def _auto_unfollow_follow_backs_sync():
         logger.error(f"Erro no auto_unfollow_follow_backs: {e}")
 
 
+
+async def run_weekly_report():
+    """Envia relatorio semanal (texto + grafico) para o dono via Telegram."""
+    try:
+        from database.accounts import AccountsDB
+        from reports.daily import ReportGenerator
+        adb = AccountsDB()
+        reporter = ReportGenerator()
+        accounts = adb.list_active_accounts()
+        for acc in accounts:
+            text  = reporter.generate_text(acc["id"], acc["username"])
+            chart = reporter.generate_chart(acc["id"], acc["username"])
+            if _telegram_app:
+                await _telegram_app.bot.send_photo(
+                    chat_id=TELEGRAM_OWNER_ID,
+                    photo=chart,
+                    caption=text,
+                    parse_mode="Markdown"
+                )
+    except Exception as e:
+        logger.error(f"Erro no relatorio semanal: {e}")
+
 async def run_manual_mode():
     """Roda follow job continuamente até _MANUAL_MODE = False."""
     global _MANUAL_MODE
@@ -364,6 +386,9 @@ def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
 
     # Unfollow — 1x por dia às 9h30
     scheduler.add_job(run_unfollow_job, CronTrigger(hour=9, minute=30), id="unfollow_job")
+
+    # Relatorio semanal — domingo as 20h
+    scheduler.add_job(run_weekly_report, CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekly_report")
 
     # Backup de sessões — a cada 6h
     scheduler.add_job(run_session_backup_job, CronTrigger(hour="*/6"), id="session_backup")
