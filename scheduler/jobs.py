@@ -67,16 +67,20 @@ def _run_follow_job_sync(ignore_schedule: bool = False) -> list[str]:
                 continue
 
         ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
-        # Restaurar sessão salva — evita login com senha vazia
+        # Restaurar sessão salva — SEMPRE validar, mesmo se existir backup
         from database.accounts import AccountsDB as _ADB
         _sess = _ADB().load_session_backup(username)
+        sessao_valida = False
         if _sess:
             ig.load_session_from_data(_sess)
-        elif not ig.is_logged_in():
+            sessao_valida = ig.is_logged_in()
+        if not sessao_valida:
             result = ig.login()
             if result != "ok":
+                risk_detector.notify_session_expired(username)
                 notifications.append(
-                    f"❌ Falha de login — *@{username}* (`{result}`)."
+                    f"🔒 *@{username}* — sessão inválida/revogada.\n"
+                    f"Use `/conta_sessao @{username} SESSIONID` para reconectar."
                 )
                 continue
 
@@ -289,9 +293,12 @@ def _auto_unfollow_follow_backs_sync():
             username = acc["username"]
             ig = InstagramClient(username, acc.get("password",""), acc.get("fingerprint"))
             sess = adb.load_session_backup(username)
+            sessao_valida = False
             if sess:
                 ig.load_session_from_data(sess)
-            elif not ig.is_logged_in():
+                sessao_valida = ig.is_logged_in()
+            if not sessao_valida:
+                risk_detector.notify_session_expired(username)
                 continue
 
             wl = WhitelistFilter(db.get_whitelist(acc["id"]))
@@ -464,10 +471,12 @@ async def run_unfollow_external_job(username: str):
     # Restaurar sessao
     ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
     sess = adb.load_session_backup(username)
+    sessao_valida = False
     if sess:
         ig.load_session_from_data(sess)
-    elif not ig.is_logged_in():
-        await _notify(f"❌ Nao foi possivel autenticar @{username} para unfollow externo.")
+        sessao_valida = ig.is_logged_in()
+    if not sessao_valida:
+        risk_detector.notify_session_expired(username)
         return
 
     # Buscar quem segue no Instagram via API
