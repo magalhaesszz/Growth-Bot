@@ -388,13 +388,22 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for acc in accounts:
         stats = db.get_stats_today(acc["id"])
         risk = risk_detector.get_status(acc["username"])
-        icon = "🔴" if risk["is_paused"] else "🟢"
         follows_hoje   = stats.get("follow", 0)
         unfollows_hoje = stats.get("unfollow", 0)
         limite_follow  = acc.get("daily_follows", 80)
         limite_unf     = acc.get("daily_unfollows", 50)
+        motivo_pausa   = risk.get("pause_reason", "")
+        if risk["is_paused"] and "sess" in motivo_pausa.lower():
+            icon = "🔒"
+            status_label = "sessão inválida — reconecte"
+        elif risk["is_paused"]:
+            icon = "🔴"
+            status_label = f"pausada — {motivo_pausa}" if motivo_pausa else "pausada"
+        else:
+            icon = "🟢"
+            status_label = acc["status"]
         lines.append(
-            f"{icon} *@{acc['username']}* ({acc['status']})\n"
+            f"{icon} *@{acc['username']}* ({status_label})\n"
             f"  ✅ Follows: {follows_hoje}/{limite_follow}\n"
             f"  🔄 Unfollows: {unfollows_hoje}/{limite_unf}\n"
             f"  👁 Stories: {stats.get('story_view', 0)}\n"
