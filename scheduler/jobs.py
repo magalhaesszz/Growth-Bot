@@ -355,6 +355,7 @@ def is_manual_mode() -> bool:
 def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
     global _telegram_app
     _telegram_app = telegram_app
+    risk_detector.set_notify_fn(_notify)  # alerta proativo quando conta e pausada
 
     scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
 
