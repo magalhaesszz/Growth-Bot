@@ -138,6 +138,66 @@ class VideoDB:
             logger.error(f"Erro ao buscar fundo: {e}")
             return None
 
+    # ─── Multiplos fundos ────────────────────────────────────
+
+    def save_fundo_named(self, user_id: int, fundo_bytes: bytes, filename: str, nome: str) -> str | None:
+        """Salva um fundo nomeado (ate 5 por usuario), sem apagar os outros."""
+        import re
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "", nome.replace(" ", "_"))[:30] or "fundo"
+        path = f"fundos/{user_id}/{slug}.png"
+        try:
+            try:
+                self.sb.storage.from_(self.BUCKET).remove([path])
+            except Exception:
+                pass
+            self.sb.storage.from_(self.BUCKET).upload(
+                path, fundo_bytes,
+                {"content-type": "image/png", "upsert": "true"}
+            )
+            self.sb.table("config_fundos").upsert({
+                "user_id": user_id, "slug": slug,
+                "nome": nome, "storage_path": path, "filename": filename,
+            }, on_conflict="user_id,slug").execute()
+            return path
+        except Exception as e:
+            logger.error(f"Erro ao salvar fundo nomeado: {e}")
+            return None
+
+    def list_fundos(self, user_id: int) -> list[dict]:
+        """Lista todos os fundos salvos do usuario."""
+        try:
+            res = (self.sb.table("config_fundos")
+                   .select("*").eq("user_id", user_id)
+                   .order("created_at", desc=False).execute())
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Erro ao listar fundos: {e}")
+            return []
+
+    def set_fundo_ativo(self, user_id: int, slug: str) -> bool:
+        """Marca um fundo como ativo — sera usado ao processar. Copia para o slot principal."""
+        try:
+            res = (self.sb.table("config_fundos")
+                   .select("*").eq("user_id", user_id).eq("slug", slug).execute())
+            if not res.data:
+                return False
+            fundo = res.data[0]
+            data = self.sb.storage.from_(self.BUCKET).download(fundo["storage_path"])
+            self.save_fundo(user_id, data, fundo["filename"])
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao ativar fundo: {e}")
+            return False
+
+    def delete_fundo_named(self, user_id: int, slug: str):
+        try:
+            path = f"fundos/{user_id}/{slug}.png"
+            self.sb.storage.from_(self.BUCKET).remove([path])
+            self.sb.table("config_fundos").delete().eq("user_id", user_id).eq("slug", slug).execute()
+        except Exception as e:
+            logger.error(f"Erro ao remover fundo nomeado: {e}")
+
+
     def get_fundo_info(self, user_id: int) -> dict | None:
         """Retorna info do fundo cadastrado."""
         try:
