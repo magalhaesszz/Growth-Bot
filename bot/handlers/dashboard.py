@@ -191,8 +191,15 @@ def _usuario_detail_keyboard(uid: int, is_admin: bool) -> InlineKeyboardMarkup:
     toggle_cb = f"dash:usr:demote:{uid}" if is_admin else f"dash:usr:promote:{uid}"
     return InlineKeyboardMarkup([
         [_button(toggle,               toggle_cb)],
-        [_button("🗑 Remover", f"dash:usr:remove:{uid}")],
+        [_button("🗑 Remover", f"dash:usr:remove_confirm:{uid}")],
         [_button("Voltar",             "dash:usuarios:lista")],
+    ])
+
+
+def _usuario_confirm_remove_keyboard(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_button("Sim, remover", f"dash:usr:remove:{uid}")],
+        [_button("Cancelar",     f"dash:usr:detail:{uid}")],
     ])
 
 def _safe(value, default="-"):
@@ -718,6 +725,18 @@ async def _handle_usuarios(update, ctx, data: str):
     from bot.access import get_all_users, save_user, remove_user
     from datetime import datetime
 
+    def _audit(acao: str, alvo: str):
+        try:
+            from database.operations import DB
+            DB().sb.table("audit_log").insert({
+                "actor_id": update.effective_user.id,
+                "actor_username": update.effective_user.username or "?",
+                "action": acao,
+                "target": alvo,
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Erro auditoria: {e}")
+
     if data in ("dash:usuarios", "dash:usuarios:reload"):
         await _show(update, _usuarios_text(), _usuarios_keyboard())
 
@@ -757,6 +776,14 @@ async def _handle_usuarios(update, ctx, data: str):
             f"*@{name}*\nID: `{uid}`\nTipo: {crown}\nDesde: {info.get('added_at','?')}\n\nEscolha:",
             _usuario_detail_keyboard(uid, admin))
 
+    elif data.startswith("dash:usr:remove_confirm:"):
+        uid  = int(data.split(":")[-1])
+        info = get_all_users().get(uid, {})
+        name = info.get("username") or str(uid)
+        await _show(update,
+            f"⚠️ *Confirmar remoção*\n\nRemover @{name} (`{uid}`) do bot?",
+            _usuario_confirm_remove_keyboard(uid))
+
     elif data.startswith("dash:usr:promote:"):
         uid  = int(data.split(":")[-1])
         info = dict(get_all_users().get(uid, {}))
@@ -783,6 +810,7 @@ async def _handle_usuarios(update, ctx, data: str):
         info = get_all_users().get(uid, {})
         name = info.get("username") or str(uid)
         remove_user(uid)
+        _audit("remove_user", f"{name} ({uid})")
         # Voltar para lista após remover
         users = get_all_users()
         if not users:
