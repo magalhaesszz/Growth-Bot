@@ -25,6 +25,8 @@ AGUARDANDO_CROP      = 18
 AGUARDANDO_FUNDO_DL  = 19
 AGUARDANDO_SPEED     = 20
 AGUARDANDO_FLIP      = 21
+AGUARDANDO_FUNDO_NOME    = 22
+AGUARDANDO_FUNDO_IMAGEM  = 23
 
 
 def owner_only(func):
@@ -700,6 +702,93 @@ async def receber_fundo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+
+@owner_only
+async def cmd_fundos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Lista todos os fundos salvos e permite escolher qual usar."""
+    fundos = await asyncio.to_thread(vdb.list_fundos, _uid(update))
+    if not fundos:
+        await update.message.reply_text(
+            "Nenhum fundo salvo ainda. Use /fundo para cadastrar o primeiro.")
+        return
+    rows = [
+        [InlineKeyboardButton(f"🎨 {f['nome']}", callback_data=f"fnd:use:{f['slug']}")]
+        for f in fundos[:5]
+    ]
+    rows.append([InlineKeyboardButton("➕ Adicionar novo", callback_data="fnd:add")])
+    await update.message.reply_text(
+        f"*Seus fundos ({len(fundos)}/5):*\n\nToque para usar como ativo:",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode="Markdown"
+    )
+
+
+async def on_fundo_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.replace("fnd:", "")
+
+    if data == "add":
+        ctx.user_data["fundo_nome_pending"] = True
+        await query.edit_message_text(
+            "Digite um nome curto para o novo fundo (ex: `roxo`, `praia`):",
+            parse_mode="Markdown")
+        return AGUARDANDO_FUNDO_NOME
+
+    if data.startswith("use:"):
+        slug = data.replace("use:", "")
+        ok = await asyncio.to_thread(vdb.set_fundo_ativo, _uid(update), slug)
+        if ok:
+            await query.edit_message_text(f"✅ Fundo ativado! Será usado nos próximos processamentos.")
+        else:
+            await query.edit_message_text("❌ Erro ao ativar fundo.")
+        return ConversationHandler.END
+
+    if data.startswith("del:"):
+        slug = data.replace("del:", "")
+        await asyncio.to_thread(vdb.delete_fundo_named, _uid(update), slug)
+        await query.edit_message_text("🗑 Fundo removido.")
+        return ConversationHandler.END
+
+
+async def receber_nome_fundo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    nome = (update.message.text or "").strip()
+    if not nome:
+        await update.message.reply_text("Digite um nome válido.")
+        return AGUARDANDO_FUNDO_NOME
+    ctx.user_data["fundo_nome"] = nome
+    await update.message.reply_text(
+        f"Nome: *{nome}*\n\nAgora envie a imagem PNG/JPG:",
+        parse_mode="Markdown")
+    return AGUARDANDO_FUNDO_IMAGEM
+
+
+async def receber_imagem_fundo_nomeado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg   = update.message
+    nome  = ctx.user_data.get("fundo_nome", "fundo")
+    photo = msg.photo or (
+        msg.document if msg.document and
+        msg.document.mime_type and
+        msg.document.mime_type.startswith("image") else None)
+    if not photo:
+        await msg.reply_text("❌ Envie uma imagem PNG ou JPG.")
+        return AGUARDANDO_FUNDO_IMAGEM
+
+    file_obj = await (photo[-1] if isinstance(photo, list) else photo).get_file()
+    fb = bytes(await file_obj.download_as_bytearray())
+    fn = getattr(msg.document, "file_name", "fundo.png") if msg.document else "fundo.png"
+
+    sp = await asyncio.to_thread(vdb.save_fundo_named, _uid(update), fb, fn, nome)
+    if sp:
+        await msg.reply_text(
+            f"✅ Fundo *{nome}* salvo!\nUse /fundos para escolher qual está ativo.",
+            parse_mode="Markdown")
+    else:
+        await msg.reply_text("❌ Erro ao salvar. Tente novamente.")
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
 @owner_only
 async def cmd_video_lote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["lote_videos"] = []
@@ -870,6 +959,18 @@ def register_video_handlers(app):
         per_user=True, per_message=False,
     ))
 
+    app.add_handler(CommandHandler("fundos", cmd_fundos))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_fundo_action, pattern=r"^fnd:")],
+        states={
+            AGUARDANDO_FUNDO_NOME: [MessageHandler(filters.TEXT, receber_nome_fundo)],
+            AGUARDANDO_FUNDO_IMAGEM: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receber_imagem_fundo_nomeado),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_user=True, per_message=False,
+    ))
     app.add_handler(CommandHandler("video_status",       cmd_video_status))
     app.add_handler(CommandHandler("config_video",       cmd_config_video))
     app.add_handler(CommandHandler("config_video_reset", cmd_config_video_reset))
