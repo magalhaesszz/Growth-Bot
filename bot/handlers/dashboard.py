@@ -1136,6 +1136,38 @@ async def cmd_auditoria(update, ctx):
     lines.append("\n_Uso: /auditoria @usuario ou /auditoria acao_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+async def cmd_ajuda(update, ctx):
+    """Lista os comandos principais agrupados por categoria."""
+    texto = (
+        "*Comandos do Growth Bot*\n\n"
+        "*Painel*\n"
+        "/start — abrir o painel de controle\n"
+        "/status — status e limites usados hoje\n"
+        "/stats_completo — panorama historico completo\n\n"
+        "*Contas Instagram*\n"
+        "/conta_sessao @user SESSIONID — conectar conta\n"
+        "/conta_lista — listar contas\n\n"
+        "*Alvos e campanhas*\n"
+        "/alvo_add link — adicionar pagina alvo\n"
+        "/alvo_lista — listar alvos\n"
+        "/campanha_nova nome — criar campanha\n\n"
+        "*Seguidores*\n"
+        "/seguidos — ultimos seguidos com data\n"
+        "/nao_seguem [numero] — quem nao seguiu de volta\n"
+        "/deixar_seguir @user — parar de seguir alguem\n\n"
+        "*Video*\n"
+        "/download — baixar do Instagram/TikTok\n"
+        "/fundo — cadastrar fundo simples\n"
+        "/fundos — gerenciar varios fundos\n"
+        "/biblioteca — videos salvos\n\n"
+        "*Administracao*\n"
+        "/auditoria — historico de acoes\n"
+        "/relatorio — relatorio semanal manual\n\n"
+        "_Use o botao /start para acessar tudo pelo painel visual._"
+    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1489,6 +1521,7 @@ async def _handle_config_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 def register_dashboard_handlers(app):
     app.add_handler(CommandHandler("auditoria", cmd_auditoria))
+    app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     # Comandos e callbacks do painel têm padrões próprios. Texto livre fica no
     # grupo 1 para não engolir códigos e respostas dos ConversationHandlers.
     app.add_handler(CommandHandler("start", cmd_start), group=-1)
