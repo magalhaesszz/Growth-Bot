@@ -1096,6 +1096,32 @@ async def _handle_unfollow_naobot_executar(update, ctx):
     import asyncio
     asyncio.create_task(run_unfollow_external_job(acc["username"]))
 
+
+async def cmd_auditoria(update, ctx):
+    """Mostra as ultimas acoes administrativas registradas."""
+    from bot.access import is_owner
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ Apenas o dono pode ver a auditoria.")
+        return
+    try:
+        from database.operations import DB
+        rows = (DB().sb.table("audit_log")
+                .select("*").order("created_at", desc=True).limit(20).execute().data or [])
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao buscar auditoria: {e}")
+        return
+    if not rows:
+        await update.message.reply_text("Nenhuma acao registrada ainda.")
+        return
+    lines = ["*Ultimas acoes administrativas:*\n"]
+    for r in rows:
+        date = (r.get("created_at") or "")[:16].replace("T", " ")
+        lines.append(
+            f"• {date} — @{r.get('actor_username','?')} "
+            f"*{r.get('action')}* → {r.get('target','')}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1448,6 +1474,7 @@ async def _handle_config_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 
 def register_dashboard_handlers(app):
+    app.add_handler(CommandHandler("auditoria", cmd_auditoria))
     # Comandos e callbacks do painel têm padrões próprios. Texto livre fica no
     # grupo 1 para não engolir códigos e respostas dos ConversationHandlers.
     app.add_handler(CommandHandler("start", cmd_start), group=-1)
