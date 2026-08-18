@@ -648,6 +648,50 @@ async def on_unfollow_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Removidos: *{result['unfollowed']}* | Erros: {result['errors']}",
         parse_mode="Markdown")
 
+
+@owner_only
+async def cmd_stats_completo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Panorama historico completo da conta — total seguido, taxa de follow-back, pendentes."""
+    acc = _first_account()
+    if not acc:
+        await update.message.reply_text("Nenhuma conta ativa.")
+        return
+    db = DB()
+    try:
+        total_following = (db.sb.table("ig_followed")
+            .select("id", count="exact")
+            .eq("account_id", acc["id"]).eq("status", "following")
+            .execute().count or 0)
+        total_unfollowed = (db.sb.table("ig_followed")
+            .select("id", count="exact")
+            .eq("account_id", acc["id"]).eq("status", "unfollowed")
+            .execute().count or 0)
+        total_follow_back = (db.sb.table("ig_followed")
+            .select("id", count="exact")
+            .eq("account_id", acc["id"]).eq("follows_back", True)
+            .execute().count or 0)
+        total_pendente_check = (db.sb.table("ig_followed")
+            .select("id", count="exact")
+            .eq("account_id", acc["id"]).eq("status", "following").eq("follows_back", False)
+            .execute().count or 0)
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao buscar estatisticas: {e}")
+        return
+
+    total_seguido_historico = total_following + total_unfollowed
+    taxa = f"{(total_follow_back/total_seguido_historico*100):.1f}%" if total_seguido_historico else "0%"
+
+    await update.message.reply_text(
+        f"*Panorama completo — @{acc['username']}*\n\n"
+        f"Total ja seguido (historico): *{total_seguido_historico}*\n"
+        f"Seguindo atualmente: *{total_following}*\n"
+        f"Ja deixou de seguir: *{total_unfollowed}*\n"
+        f"Seguiram de volta: *{total_follow_back}*\n"
+        f"Taxa de follow-back: *{taxa}*\n"
+        f"Ainda seguindo sem confirmar volta: *{total_pendente_check}*",
+        parse_mode="Markdown"
+    )
+
 def register_operacoes_handlers(app):
     handlers = [
         ("alvo_add",         cmd_alvo_add),
