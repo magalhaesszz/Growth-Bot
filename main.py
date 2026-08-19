@@ -8,6 +8,7 @@ from bot.handlers.dashboard import register_dashboard_handlers
 from bot.handlers.operacoes import register_operacoes_handlers
 from bot.handlers.video import register_video_handlers
 from bot.runtime_guards import register_runtime_guards
+from bot.video_editor_delivery import register_video_editor_delivery_guard
 from config import TELEGRAM_TOKEN, validate_config
 from scheduler.jobs import setup_scheduler
 from scheduler.story_monitor import attach_story_monitor
@@ -87,6 +88,9 @@ def main():
         .build()
     )
     app.add_error_handler(on_error)
+
+    # Grupo -6: entrega do editor visual antes do ConversationHandler legado.
+    register_video_editor_delivery_guard(app)
 
     # Grupos -5/-4: permissao, limites de memoria e overrides de seguranca.
     register_runtime_guards(app)
