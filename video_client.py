@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import tempfile
 
 import httpx
 
@@ -14,7 +16,12 @@ logger = logging.getLogger(__name__)
 
 HEADERS = {"x-api-secret": VIDEO_API_SECRET}
 TIMEOUT = httpx.Timeout(300.0, connect=15.0)
+# O servidor de video possui timeout proprio de 300s. Damos uma pequena folga
+# para ele conseguir devolver um erro estruturado em vez de o cliente cortar a
+# conexao exatamente no mesmo instante.
+PROCESS_TIMEOUT = httpx.Timeout(330.0, connect=15.0)
 _MB = 1024 * 1024
+_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 def _check_configured() -> None:
@@ -53,6 +60,14 @@ def _response_error(response: httpx.Response) -> str:
     except (ValueError, json.JSONDecodeError):
         pass
     return response.text.strip() or f"HTTP {response.status_code}"
+
+
+def _response_filename(response: httpx.Response, default: str) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    if "filename=" not in disposition:
+        return default
+    value = disposition.split("filename=", 1)[1].split(";", 1)[0].strip().strip('"')
+    return value or default
 
 
 def _error(exc: Exception) -> dict:
@@ -114,10 +129,7 @@ def processar_video(
         if not response.is_success:
             return {"ok": False, "error": _response_error(response)}
         _validate_video_size(response.content, "video processado")
-        disposition = response.headers.get("content-disposition", "")
-        output_name = filename
-        if "filename=" in disposition:
-            output_name = disposition.split("filename=")[-1].strip('"')
+        output_name = _response_filename(response, filename)
         return {
             "ok": True,
             "video_bytes": response.content,
@@ -125,6 +137,77 @@ def processar_video(
             "size_mb": round(_size_mb(response.content), 2),
         }
     except Exception as exc:
+        return _error(exc)
+
+
+def processar_video_arquivo(
+    video_bytes: bytes,
+    filename: str,
+    account_id: str = "default",
+    cfg: dict | None = None,
+) -> dict:
+    """Processa e grava a resposta em disco sem manter o MP4 final inteiro na RAM.
+
+    O caminho do editor visual já mantém o vídeo original em memória. Ler também
+    toda a resposta processada com ``response.content`` pode duplicar dezenas de
+    MB dentro do processo do bot e provocar encerramento por memória durante a
+    entrega ao Telegram. Esta variante faz streaming da resposta para /tmp.
+
+    O chamador é responsável por remover ``video_path`` depois do envio.
+    """
+    output_path = ""
+    try:
+        _check_configured()
+        _validate_video_size(video_bytes, filename)
+
+        fd, output_path = tempfile.mkstemp(prefix="growth-video-", suffix=".mp4")
+        os.close(fd)
+        total_bytes = 0
+        max_bytes = int(VIDEO_MAX_FILE_MB * _MB)
+        output_name = filename
+
+        with httpx.Client(timeout=PROCESS_TIMEOUT) as client:
+            with client.stream(
+                "POST",
+                f"{VIDEO_API_URL}/api/v1/processar",
+                headers=HEADERS,
+                files={"video": (filename, video_bytes, "video/mp4")},
+                data={"account_id": account_id, "config_json": json.dumps(cfg or {})},
+            ) as response:
+                if not response.is_success:
+                    # Em modo streaming o corpo precisa ser lido antes de gerar
+                    # a mensagem de erro da API.
+                    response.read()
+                    raise RuntimeError(_response_error(response))
+
+                output_name = _response_filename(response, filename)
+                with open(output_path, "wb") as output_file:
+                    for chunk in response.iter_bytes(chunk_size=_STREAM_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise ValueError(
+                                "video processado excedeu o limite seguro de "
+                                f"{VIDEO_MAX_FILE_MB} MB."
+                            )
+                        output_file.write(chunk)
+
+        if total_bytes <= 0:
+            raise RuntimeError("A Video API retornou um arquivo vazio.")
+
+        return {
+            "ok": True,
+            "video_path": output_path,
+            "filename": output_name,
+            "size_mb": round(total_bytes / _MB, 2),
+        }
+    except Exception as exc:
+        if output_path:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
         return _error(exc)
 
 
