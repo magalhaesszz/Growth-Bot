@@ -1,12 +1,19 @@
-import time
-import random
 import logging
-from datetime import datetime, date
+import random
+import time
 
-from instagram.score import ProfileScorer, BlacklistFilter
 from instagram.risk_detector import RiskDetector
+from instagram.score import BlacklistFilter, ProfileScorer
 
 logger = logging.getLogger(__name__)
+
+
+def _sleep(seconds: float, stop_event=None) -> bool:
+    """Espera e retorna False quando uma parada cooperativa foi solicitada."""
+    if stop_event is not None:
+        return not stop_event.wait(max(0.0, seconds))
+    time.sleep(max(0.0, seconds))
+    return True
 
 
 class Follower:
@@ -23,22 +30,18 @@ class Follower:
         self.risk = risk_detector
         self.scorer = scorer or ProfileScorer()
         self.blacklist = blacklist or BlacklistFilter([])
-        self._followed_today = 0
-        self._today = date.today()
+        # O scheduler calcula a cota restante no banco. Este contador vale para
+        # toda a instancia e impede dupla contagem entre varios alvos do job.
+        self._followed_in_run = 0
 
-    def _reset_if_new_day(self):
-        today = date.today()
-        if today != self._today:
-            self._followed_today = 0
-            self._today = today
-
-    def _can_follow(self, daily_limit: int) -> bool:
-        self._reset_if_new_day()
-        if self.risk.is_paused(self.username):
-            logger.warning(f"[{self.username}] Conta pausada — follow bloqueado.")
+    def _can_follow(self, run_limit: int, stop_event=None) -> bool:
+        if stop_event is not None and stop_event.is_set():
             return False
-        if self._followed_today >= daily_limit:
-            logger.info(f"[{self.username}] Limite diário atingido ({daily_limit}).")
+        if self.risk.is_paused(self.username):
+            logger.warning("[%s] Conta pausada — follow bloqueado.", self.username)
+            return False
+        if self._followed_in_run >= max(0, int(run_limit)):
+            logger.info("[%s] Cota restante do job atingida.", self.username)
             return False
         return True
 
@@ -49,69 +52,70 @@ class Follower:
         min_score: int,
         delay_min: int,
         delay_max: int,
-        on_success=None,  # callback(username, user_id) após cada follow
+        on_success=None,
+        stop_event=None,
     ) -> dict:
-        """
-        Segue perfis de uma lista respeitando limites, score e blacklist.
-        Retorna resumo {"followed": N, "skipped": N, "errors": N}.
-        """
-        results = {"followed": 0, "skipped": 0, "errors": 0}
+        """Segue perfis respeitando a cota restante calculada pelo scheduler."""
+        results = {"followed": 0, "skipped": 0, "errors": 0, "stopped": False}
 
         for profile in profiles:
-            if not self._can_follow(daily_limit):
+            if not self._can_follow(daily_limit, stop_event):
+                results["stopped"] = bool(stop_event and stop_event.is_set())
                 break
 
-            uname = profile.get("username", "")
-            uid = profile.get("user_id", "")
-
-            # blacklist
-            if self.blacklist.is_blocked(profile):
+            uname = str(profile.get("username", "") or "")
+            uid = str(profile.get("user_id", "") or "")
+            if not uname or not uid or not uid.isdigit():
                 results["skipped"] += 1
                 continue
 
-            # score mínimo
+            if self.blacklist.is_blocked(profile):
+                results["skipped"] += 1
+                continue
             if not self.scorer.passes(profile, min_score):
                 results["skipped"] += 1
                 continue
 
-            # tenta seguir
             try:
                 self.cl.user_follow(int(uid))
-                self._followed_today += 1
+                self._followed_in_run += 1
                 results["followed"] += 1
                 self.risk.record_success(self.username)
                 self.client.save_session()
-                logger.info(f"[{self.username}] Seguiu @{uname} ✓")
+                logger.info("[%s] Seguiu @%s", self.username, uname)
 
                 if on_success:
                     on_success(uname, uid)
 
-                # delay humano
-                delay = random.uniform(delay_min, delay_max)
-                time.sleep(delay)
+                if not _sleep(random.uniform(delay_min, delay_max), stop_event):
+                    results["stopped"] = True
+                    break
 
-            except Exception as e:
+            except Exception as exc:
                 results["errors"] += 1
-                err_str = str(e).lower()
+                err_str = str(exc).lower()
 
-                # Sessao expirada / logout forcado pelo Instagram
-                if any(k in err_str for k in ("login_required", "loginrequired", "sessionid")):
+                if any(
+                    marker in err_str
+                    for marker in ("login_required", "loginrequired", "sessionid")
+                ):
                     self.risk.notify_session_expired(self.username)
-                    results["errors"] += 1
-                    break  # para o batch — sessao invalida, sem sentido continuar
+                    break
 
-                self.risk.record_error(self.username, e)
-                logger.error(f"[{self.username}] Erro ao seguir @{uname}: {e}")
+                self.risk.record_error(self.username, exc)
+                logger.error("[%s] Erro ao seguir @%s: %s", self.username, uname, exc)
 
                 if self.risk.is_paused(self.username):
-                    break  # para o batch se conta foi pausada
-
-                time.sleep(random.uniform(10, 30))  # cooldown após erro
+                    break
+                if not _sleep(random.uniform(10, 30), stop_event):
+                    results["stopped"] = True
+                    break
 
         logger.info(
-            f"[{self.username}] Batch concluído — "
-            f"seguidos: {results['followed']}, "
-            f"pulados: {results['skipped']}, "
-            f"erros: {results['errors']}"
+            "[%s] Batch concluido — seguidos=%s pulados=%s erros=%s",
+            self.username,
+            results["followed"],
+            results["skipped"],
+            results["errors"],
         )
         return results

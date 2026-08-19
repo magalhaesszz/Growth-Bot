@@ -2,7 +2,10 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
+import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -36,8 +39,21 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Estado temporário das verificações em andamento. Nunca contém senha ou código.
+# Estado temporario das verificacoes em andamento. Nunca contem senha ou codigo.
 PENDING_CHALLENGES: dict[str, dict] = {}
+
+_SESSION_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _session_lock(username: str) -> threading.RLock:
+    key = username.casefold()
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SESSION_LOCKS[key] = lock
+        return lock
 
 
 def _normalize_code(code: str) -> str:
@@ -63,7 +79,7 @@ def _format_preview(code: str) -> str:
 
 
 class InstagramClient:
-    """Cliente Instagram com identidade estável e verificação não bloqueante."""
+    """Cliente Instagram com identidade estavel e verificacao nao bloqueante."""
 
     def __init__(self, username: str, password: str, device_fingerprint: dict = None):
         self.username = username.strip().lstrip("@")
@@ -96,9 +112,9 @@ class InstagramClient:
                 session.trust_env = False
         if INSTAGRAM_USE_PROXY and INSTAGRAM_PROXY:
             client.set_proxy(INSTAGRAM_PROXY)
-            logger.info("[%s] Proxy explícita configurada.", self.username)
+            logger.info("[%s] Proxy explicita configurada.", self.username)
         else:
-            logger.info("[%s] Conexão direta, sem proxy.", self.username)
+            logger.info("[%s] Conexao direta, sem proxy.", self.username)
         client.set_country(INSTAGRAM_COUNTRY)
         client.set_country_code(INSTAGRAM_COUNTRY_CODE)
         client.set_locale(INSTAGRAM_LOCALE)
@@ -140,16 +156,17 @@ class InstagramClient:
         """Retorna imediatamente: ok, challenge, two_factor ou error:motivo."""
         if self.session_path.exists():
             try:
-                self.cl.load_settings(str(self.session_path))
+                with _session_lock(self.username):
+                    self.cl.load_settings(str(self.session_path))
                 self._apply_network_identity(self.cl)
                 self.cl.get_timeline_feed()
-                logger.info("[%s] Sessão restaurada com sucesso.", self.username)
+                logger.info("[%s] Sessao restaurada com sucesso.", self.username)
                 return "ok"
             except LoginRequired:
-                logger.info("[%s] Sessão expirada; iniciando novo login.", self.username)
+                logger.info("[%s] Sessao expirada; iniciando novo login.", self.username)
             except Exception as exc:
                 logger.warning(
-                    "[%s] Sessão salva não pôde ser reutilizada: %s",
+                    "[%s] Sessao salva nao pôde ser reutilizada: %s",
                     self.username,
                     type(exc).__name__,
                 )
@@ -157,7 +174,7 @@ class InstagramClient:
         return self._begin_caa_login()
 
     def _begin_caa_login(self) -> str:
-        """Executa o CAA até a etapa anterior ao código e devolve o controle ao bot."""
+        """Executa o CAA ate a etapa anterior ao codigo e devolve o controle ao bot."""
         try:
             logger.info("[%s] Iniciando login CAA.", self.username)
             if not self.cl.bloks_caa_login_prepare(username=self.username):
@@ -187,8 +204,6 @@ class InstagramClient:
 
             text = self.cl._bloks_all_text(result).casefold()
             if "incorrect password" in text or "senha incorreta" in text:
-                # O CAA também usa "incorrect password" como recusa genérica
-                # do fluxo/dispositivo. Tente o login padrão antes de concluir.
                 logger.info(
                     "[%s] CAA recusou a credencial; tentando fluxo padrao.",
                     self.username,
@@ -222,7 +237,7 @@ class InstagramClient:
             return f"error:{type(exc).__name__}"
 
     def _try_standard_login(self) -> str:
-        """Tenta o fluxo padrão da biblioteca sem diagnosticar falsamente a senha."""
+        """Tenta o fluxo padrao da biblioteca sem diagnosticar falsamente a senha."""
         try:
             if self.cl.login(self.username, self.password):
                 self._save_session()
@@ -252,41 +267,40 @@ class InstagramClient:
             return f"error:{type(exc).__name__}"
 
     def login_with_sessionid(self, sessionid: str) -> str:
-        """Importa uma sessão já autenticada no app/site oficial."""
+        """Importa uma sessao ja autenticada no app/site oficial."""
         clean = str(sessionid).strip()
         if len(clean) <= 30 or not re.match(r"^\d+", clean):
             return "error:invalid_sessionid"
+        tmp_path = None
         try:
-            # Criar client temporário SEM proxy para importar sessionid
-            # O proxy causa TooManyRedirects na autenticação por cookie
+            # Client temporario sem proxy: proxy pode causar redirects no cookie.
             temp_cl = Client()
-            temp_cl.set_uuids({
-                "phone_id": self._stable_uuid("phone_id"),
-                "uuid": self._stable_uuid("uuid"),
-                "client_session_id": self._stable_uuid("client_session_id"),
-                "advertising_id": self._stable_uuid("advertising_id"),
-                "android_device_id": "android-" + self._stable_bytes("android_device_id").hex()[:16],
-                "request_id": self._stable_uuid("request_id"),
-                "tray_session_id": self._stable_uuid("tray_session_id"),
-            })
+            temp_cl.set_uuids(
+                {
+                    "phone_id": self._stable_uuid("phone_id"),
+                    "uuid": self._stable_uuid("uuid"),
+                    "client_session_id": self._stable_uuid("client_session_id"),
+                    "advertising_id": self._stable_uuid("advertising_id"),
+                    "android_device_id": "android-"
+                    + self._stable_bytes("android_device_id").hex()[:16],
+                    "request_id": self._stable_uuid("request_id"),
+                    "tray_session_id": self._stable_uuid("tray_session_id"),
+                }
+            )
             if not temp_cl.login_by_sessionid(clean):
                 return "error:session_rejected"
-            # Copiar sessão validada para o client principal
-            import tempfile, os
-            tmp = tempfile.mktemp(suffix=".json")
-            temp_cl.dump_settings(tmp)
-            self.cl.load_settings(tmp)
-            try: os.remove(tmp)
-            except: pass
+
+            fd, tmp_path = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            temp_cl.dump_settings(tmp_path)
+            self.cl.load_settings(tmp_path)
             self._apply_network_identity(self.cl)
-            # Verificar que a sessão funciona com o client principal
+
             if not self.cl.login_by_sessionid(clean):
                 return "error:session_rejected"
             authenticated_username = str(getattr(self.cl, "username", "")).lstrip("@")
             if authenticated_username.casefold() != self.username.casefold():
-                logger.warning(
-                    "[%s] Sessionid pertence a outra conta.", self.username
-                )
+                logger.warning("[%s] Sessionid pertence a outra conta.", self.username)
                 return "error:session_account_mismatch"
             self._save_session()
             self._reset_pending()
@@ -300,6 +314,12 @@ class InstagramClient:
                 type(exc).__name__,
             )
             return "error:session_rejected"
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _prepare_caa_challenge(self, send_result: dict) -> bool:
         entry_context = self.cl.bloks_extract_context_data(
@@ -334,12 +354,11 @@ class InstagramClient:
                 return True
         except Exception as exc:
             logger.warning(
-                "[%s] Código CAA rejeitado: %s", self.username, type(exc).__name__
+                "[%s] Codigo CAA rejeitado: %s", self.username, type(exc).__name__
             )
         return False
 
     def start_challenge_with_method(self, method_type: str) -> str:
-        # O fluxo CAA atual escolhe o canal no servidor.
         if self._caa_submit_context:
             return "challenge"
         return self._begin_caa_login()
@@ -370,7 +389,7 @@ class InstagramClient:
                 return True
         except Exception as exc:
             logger.warning(
-                "[%s] Código 2FA rejeitado: %s", self.username, type(exc).__name__
+                "[%s] Codigo 2FA rejeitado: %s", self.username, type(exc).__name__
             )
         return False
 
@@ -403,11 +422,24 @@ class InstagramClient:
         return False
 
     def _save_session(self) -> None:
+        """Salva a sessao de forma atomica e limpa somente pausa de sessao expirada."""
         self.session_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cl.dump_settings(str(self.session_path))
+        temp_path = self.session_path.with_name(
+            f".{self.session_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        with _session_lock(self.username):
+            try:
+                self.cl.dump_settings(str(temp_path))
+                os.replace(temp_path, self.session_path)
+            finally:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
 
         # Uma autenticacao bem-sucedida invalida apenas a pausa causada por
-        # sessao expirada. Outras pausas de risco continuam exigindo revisao.
+        # sessao expirada. Pausas por challenge/risco continuam exigindo revisao.
         try:
             from instagram.risk_detector import risk_detector
 
@@ -429,16 +461,39 @@ class InstagramClient:
         self._save_session()
 
     def get_session_data(self) -> dict:
-        if self.session_path.exists():
-            with self.session_path.open(encoding="utf-8") as session_file:
-                return json.load(session_file)
-        return {}
+        if not self.session_path.exists():
+            return {}
+        with _session_lock(self.username):
+            try:
+                with self.session_path.open(encoding="utf-8") as session_file:
+                    return json.load(session_file)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "[%s] Falha ao ler sessao local: %s",
+                    self.username,
+                    type(exc).__name__,
+                )
+                return {}
 
     def load_session_from_data(self, data: dict) -> None:
         self.session_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.session_path.open("w", encoding="utf-8") as session_file:
-            json.dump(data, session_file)
-        self.cl.load_settings(str(self.session_path))
+        temp_path = self.session_path.with_name(
+            f".{self.session_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        with _session_lock(self.username):
+            try:
+                with temp_path.open("w", encoding="utf-8") as session_file:
+                    json.dump(data, session_file)
+                    session_file.flush()
+                    os.fsync(session_file.fileno())
+                os.replace(temp_path, self.session_path)
+                self.cl.load_settings(str(self.session_path))
+            finally:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
         self._apply_network_identity(self.cl)
 
     def is_logged_in(self) -> bool:
@@ -452,7 +507,7 @@ class InstagramClient:
         return self.is_logged_in() or self.login() == "ok"
 
     def randomize_fingerprint(self):
-        # Mantido por compatibilidade: a identidade deve permanecer estável.
+        # Mantido por compatibilidade: a identidade deve permanecer estavel.
         return self._fingerprint.copy()
 
     @property

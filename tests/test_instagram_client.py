@@ -5,14 +5,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
-os.environ.setdefault("SESSION_ENCRYPTION_KEY", "test-key-not-for-production")
+os.environ.setdefault(
+    "SESSION_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)
 os.environ.setdefault("TELEGRAM_OWNER_ID", "1")
-os.environ.setdefault("TELEGRAM_TOKEN", "test-token")
+os.environ.setdefault("TELEGRAM_TOKEN", "123:test")
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "test-key")
+os.environ.setdefault("VIDEO_SETTINGS_REMOTE", "false")
 
 import instagram.client as client_module
+from instagram.risk_detector import risk_detector
 
 
 class FakeClient:
@@ -117,8 +120,14 @@ class InstagramClientTests(unittest.TestCase):
         client_module.PENDING_CHALLENGES.clear()
         FakeClient.login_result = "ok"
         FakeClient.standard_login_result = False
+        risk_detector.reset()
+        risk_detector.set_persistence(None, None)
+        risk_detector.set_notify_fn(None)
 
     def tearDown(self):
+        risk_detector.reset()
+        risk_detector.set_persistence(None, None)
+        risk_detector.set_notify_fn(None)
         self.client_patch.stop()
         self.sessions_patch.stop()
         self.temp.cleanup()
@@ -189,6 +198,41 @@ class InstagramClientTests(unittest.TestCase):
         self.assertEqual(client_module.detect_code_type("123-456"), "sms_or_totp")
         self.assertEqual(client_module.detect_code_type("1234-5678"), "backup")
         self.assertEqual(client_module.format_preview("123456"), "123-456")
+
+    def test_new_valid_session_clears_only_expired_session_pause(self):
+        risk_detector.notify_session_expired("conta")
+        self.assertTrue(risk_detector.is_paused("conta"))
+
+        ig = client_module.InstagramClient("conta", "senha")
+        ig.save_session()
+
+        status = risk_detector.get_status("conta")
+        self.assertFalse(status["is_paused"])
+        self.assertEqual(status["pause_reason"], "")
+
+    def test_new_valid_session_does_not_clear_non_session_risk_pause(self):
+        risk_detector.pause("conta", "3 erros consecutivos")
+        ig = client_module.InstagramClient("conta", "senha")
+        ig.save_session()
+
+        status = risk_detector.get_status("conta")
+        self.assertTrue(status["is_paused"])
+        self.assertEqual(status["pause_reason"], "3 erros consecutivos")
+
+    def test_session_file_replace_remains_valid_json(self):
+        ig = client_module.InstagramClient("conta", "senha")
+        ig.save_session()
+        first = ig.get_session_data()
+        ig.save_session()
+        second = ig.get_session_data()
+        self.assertIsInstance(first, dict)
+        self.assertEqual(first, second)
+
+    def test_corrupted_local_session_does_not_crash_reader(self):
+        ig = client_module.InstagramClient("conta", "senha")
+        ig.session_path.parent.mkdir(parents=True, exist_ok=True)
+        ig.session_path.write_text("{quebrado", encoding="utf-8")
+        self.assertEqual(ig.get_session_data(), {})
 
 
 if __name__ == "__main__":

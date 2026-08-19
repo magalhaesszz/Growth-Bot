@@ -1,9 +1,38 @@
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 from supabase import create_client
-from config import SUPABASE_URL, SUPABASE_KEY
+
+from config import SUPABASE_KEY, SUPABASE_URL
 
 logger = logging.getLogger(__name__)
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def _local_day_bounds(now: datetime | None = None) -> tuple[str, str]:
+    """Inicio/fim do dia de Sao Paulo convertidos para UTC (TIMESTAMPTZ)."""
+    local_now = now.astimezone(LOCAL_TZ) if now else datetime.now(LOCAL_TZ)
+    start_local = datetime.combine(local_now.date(), time.min, tzinfo=LOCAL_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _story_count(detail) -> int:
+    if detail is None:
+        return 1
+    text = str(detail)
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return 1
+    try:
+        return max(0, int(match.group(1)))
+    except ValueError:
+        return 1
 
 
 class DB:
@@ -13,14 +42,32 @@ class DB:
     # ─── Seguidos ────────────────────────────────────────────
 
     def add_followed(self, account_id, user_id, username, campaign_id=None, score=None):
-        self.sb.table("ig_followed").insert({
-            "account_id": account_id,
-            "target_user_id": user_id,
+        user_id = str(user_id)
+        existing = (
+            self.sb.table("ig_followed")
+            .select("id")
+            .eq("account_id", account_id)
+            .eq("target_user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        payload = {
             "target_username": username,
             "campaign_id": campaign_id,
             "score": score,
             "status": "following",
-        }).execute()
+            "followed_at": datetime.now(timezone.utc).isoformat(),
+            "unfollowed_at": None,
+            "follows_back": False,
+        }
+        if existing.data:
+            self.sb.table("ig_followed").update(payload).eq(
+                "id", existing.data[0]["id"]
+            ).execute()
+            return
+        self.sb.table("ig_followed").insert(
+            {"account_id": account_id, "target_user_id": user_id, **payload}
+        ).execute()
 
     def get_unfollow_candidates(self, account_id, after_days: int) -> list[dict]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
@@ -35,16 +82,21 @@ class DB:
         return res.data or []
 
     def mark_unfollowed(self, account_id, target_username):
-        self.sb.table("ig_followed").update({
-            "status": "unfollowed",
-            "unfollowed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("account_id", account_id).eq("target_username", target_username).execute()
+        self.sb.table("ig_followed").update(
+            {
+                "status": "unfollowed",
+                "unfollowed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("account_id", account_id).eq(
+            "target_username", target_username
+        ).execute()
 
     def mark_follows_back(self, account_id, target_username):
         self.sb.table("ig_followed").update({"follows_back": True}).eq(
-            "account_id", account_id).eq("target_username", target_username).execute()
+            "account_id", account_id
+        ).eq("target_username", target_username).execute()
 
-    def get_already_following_ids(self, account_id) -> set:
+    def get_already_following_ids(self, account_id) -> set[str]:
         res = (
             self.sb.table("ig_followed")
             .select("target_user_id")
@@ -52,42 +104,42 @@ class DB:
             .eq("status", "following")
             .execute()
         )
-        return {r["target_user_id"] for r in (res.data or [])}
+        return {str(row["target_user_id"]) for row in (res.data or [])}
 
-    def count_today_follows(self, account_id) -> int:
-        today = datetime.now(timezone.utc).date().isoformat()
-        res = (
-            self.sb.table("ig_followed")
-            .select("id", count="exact")
-            .eq("account_id", account_id)
-            .gte("followed_at", today)
-            .execute()
-        )
-        return res.count or 0
-
-    def count_today_unfollows(self, account_id) -> int:
-        today = datetime.now(timezone.utc).date().isoformat()
+    def _count_today_log_action(self, account_id, action: str) -> int:
+        start, end = _local_day_bounds()
         res = (
             self.sb.table("ig_action_logs")
             .select("id", count="exact")
             .eq("account_id", account_id)
-            .eq("action", "unfollow")
+            .eq("action", action)
             .eq("success", True)
-            .gte("executed_at", today)
+            .gte("executed_at", start)
+            .lt("executed_at", end)
             .execute()
         )
         return res.count or 0
 
+    def count_today_follows(self, account_id) -> int:
+        return self._count_today_log_action(account_id, "follow")
+
+    def count_today_unfollows(self, account_id) -> int:
+        return self._count_today_log_action(account_id, "unfollow")
+
     # ─── Alvos ───────────────────────────────────────────────
 
-    def add_target(self, account_id, page_url, page_username=None, page_user_id=None, campaign_id=None):
-        self.sb.table("ig_targets").insert({
-            "account_id": account_id,
-            "page_url": page_url,
-            "page_username": page_username,
-            "page_user_id": page_user_id,
-            "campaign_id": campaign_id,
-        }).execute()
+    def add_target(
+        self, account_id, page_url, page_username=None, page_user_id=None, campaign_id=None
+    ):
+        self.sb.table("ig_targets").insert(
+            {
+                "account_id": account_id,
+                "page_url": page_url,
+                "page_username": page_username,
+                "page_user_id": page_user_id,
+                "campaign_id": campaign_id,
+            }
+        ).execute()
 
     def list_targets(self, account_id) -> list[dict]:
         res = (
@@ -102,22 +154,32 @@ class DB:
 
     def remove_target(self, account_id, page_username):
         self.sb.table("ig_targets").update({"status": "removed"}).eq(
-            "account_id", account_id).eq("page_username", page_username).execute()
+            "account_id", account_id
+        ).eq("page_username", page_username).execute()
 
     def update_target_scraped(self, target_id, count: int):
-        self.sb.table("ig_targets").update({
-            "scraped_count": count,
-            "last_scraped_at": datetime.utcnow().isoformat(),
-        }).eq("id", target_id).execute()
+        count = max(0, int(count))
+        current = (
+            self.sb.table("ig_targets")
+            .select("scraped_count")
+            .eq("id", target_id)
+            .limit(1)
+            .execute()
+        )
+        previous = int(current.data[0].get("scraped_count", 0) or 0) if current.data else 0
+        self.sb.table("ig_targets").update(
+            {
+                "scraped_count": previous + count,
+                "last_scraped_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", target_id).execute()
 
     # ─── Campanhas ───────────────────────────────────────────
 
     def create_campaign(self, account_id, name, nicho=None) -> dict:
-        res = self.sb.table("ig_campaigns").insert({
-            "account_id": account_id,
-            "name": name,
-            "nicho": nicho,
-        }).execute()
+        res = self.sb.table("ig_campaigns").insert(
+            {"account_id": account_id, "name": name, "nicho": nicho}
+        ).execute()
         return res.data[0] if res.data else {}
 
     def get_active_campaign(self, account_id) -> dict | None:
@@ -143,53 +205,98 @@ class DB:
         return res.data or []
 
     def update_campaign_stats(self, campaign_id, follows=0, unfollows=0, follow_backs=0):
-        camp = self.sb.table("ig_campaigns").select("*").eq("id", campaign_id).execute()
+        # As operacoes de uma mesma conta sao serializadas no scheduler. Isso
+        # evita o read/modify/write concorrente sem exigir uma RPC especifica.
+        camp = (
+            self.sb.table("ig_campaigns")
+            .select("total_follows,total_unfollows,total_follow_backs")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
         if not camp.data:
             return
-        c = camp.data[0]
-        self.sb.table("ig_campaigns").update({
-            "total_follows": c["total_follows"] + follows,
-            "total_unfollows": c["total_unfollows"] + unfollows,
-            "total_follow_backs": c["total_follow_backs"] + follow_backs,
-        }).eq("id", campaign_id).execute()
+        current = camp.data[0]
+        self.sb.table("ig_campaigns").update(
+            {
+                "total_follows": int(current.get("total_follows", 0) or 0) + follows,
+                "total_unfollows": int(current.get("total_unfollows", 0) or 0)
+                + unfollows,
+                "total_follow_backs": int(current.get("total_follow_backs", 0) or 0)
+                + follow_backs,
+            }
+        ).eq("id", campaign_id).execute()
 
-    # ─── Whitelist / Blacklist ────────────────────────────────
+    # ─── Whitelist / Blacklist ───────────────────────────────
 
     def add_whitelist(self, account_id, username):
-        self.sb.table("ig_whitelist").upsert({
-            "account_id": account_id,
-            "target_username": username.lstrip("@"),
-        }).execute()
+        username = username.lower().lstrip("@")
+        existing = (
+            self.sb.table("ig_whitelist")
+            .select("id")
+            .eq("account_id", account_id)
+            .eq("target_username", username)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            self.sb.table("ig_whitelist").insert(
+                {"account_id": account_id, "target_username": username}
+            ).execute()
 
     def remove_whitelist(self, account_id, username):
-        self.sb.table("ig_whitelist").delete().eq(
-            "account_id", account_id).eq("target_username", username.lstrip("@")).execute()
+        self.sb.table("ig_whitelist").delete().eq("account_id", account_id).eq(
+            "target_username", username.lower().lstrip("@")
+        ).execute()
 
     def get_whitelist(self, account_id) -> list[str]:
-        res = self.sb.table("ig_whitelist").select("target_username").eq("account_id", account_id).execute()
-        return [r["target_username"] for r in (res.data or [])]
+        res = (
+            self.sb.table("ig_whitelist")
+            .select("target_username")
+            .eq("account_id", account_id)
+            .execute()
+        )
+        return [row["target_username"] for row in (res.data or [])]
 
     def add_blacklist(self, account_id, term, kind="username"):
-        self.sb.table("ig_blacklist").upsert({
-            "account_id": account_id,
-            "term": term.lower().lstrip("@"),
-            "type": kind,
-        }).execute()
+        term = term.lower().lstrip("@")
+        existing = (
+            self.sb.table("ig_blacklist")
+            .select("id")
+            .eq("account_id", account_id)
+            .eq("term", term)
+            .eq("type", kind)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            self.sb.table("ig_blacklist").insert(
+                {"account_id": account_id, "term": term, "type": kind}
+            ).execute()
 
     def get_blacklist(self, account_id) -> list[str]:
-        res = self.sb.table("ig_blacklist").select("term").eq("account_id", account_id).execute()
-        return [r["term"] for r in (res.data or [])]
+        res = (
+            self.sb.table("ig_blacklist")
+            .select("term")
+            .eq("account_id", account_id)
+            .execute()
+        )
+        return [row["term"] for row in (res.data or [])]
 
     # ─── Logs ────────────────────────────────────────────────
 
-    def log_action(self, account_id, action, target_username=None, detail=None, success=True):
-        self.sb.table("ig_action_logs").insert({
-            "account_id": account_id,
-            "action": action,
-            "target_username": target_username,
-            "detail": detail,
-            "success": success,
-        }).execute()
+    def log_action(
+        self, account_id, action, target_username=None, detail=None, success=True
+    ):
+        self.sb.table("ig_action_logs").insert(
+            {
+                "account_id": account_id,
+                "action": action,
+                "target_username": target_username,
+                "detail": detail,
+                "success": bool(success),
+            }
+        ).execute()
 
     def get_recent_logs(self, account_id, limit=20) -> list[dict]:
         res = (
@@ -202,12 +309,10 @@ class DB:
         )
         return res.data or []
 
-
     def get_following_list(self, account_id, limit: int = 200) -> list[dict]:
-        """Lista todos os seguidos pelo bot, do mais recente ao mais antigo."""
         res = (
             self.sb.table("ig_followed")
-            .select("target_username, target_user_id, followed_at, follows_back, status")
+            .select("target_username,target_user_id,followed_at,follows_back,status")
             .eq("account_id", account_id)
             .eq("status", "following")
             .order("followed_at", desc=True)
@@ -217,56 +322,59 @@ class DB:
         return res.data or []
 
     def get_non_followers(self, account_id, limit: int = 0) -> list[dict]:
-        """Retorna seguidos que NAO seguem de volta, do mais recente."""
-        q = (
+        """Registros ainda nao confirmados como follow-back no banco local."""
+        query = (
             self.sb.table("ig_followed")
-            .select("target_username, target_user_id, followed_at, follows_back")
+            .select("target_username,target_user_id,followed_at,follows_back")
             .eq("account_id", account_id)
             .eq("status", "following")
             .eq("follows_back", False)
             .order("followed_at", desc=True)
         )
         if limit > 0:
-            q = q.limit(limit)
-        return q.execute().data or []
+            query = query.limit(limit)
+        return query.execute().data or []
 
     def unfollow_user_by_username(self, account_id, username: str):
-        """Marca usuario como unfollowed no banco."""
-        self.sb.table("ig_followed").update({
-            "status": "unfollowed",
-            "unfollowed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("account_id", account_id).eq("target_username", username).execute()
+        self.mark_unfollowed(account_id, username)
 
     def check_and_mark_follow_back(self, account_id, user_id: str, username: str) -> bool:
-        """Checa se usuario segue de volta e atualiza banco. Retorna True se segue."""
         res = (
             self.sb.table("ig_followed")
             .select("follows_back")
             .eq("account_id", account_id)
-            .eq("target_user_id", user_id)
+            .eq("target_user_id", str(user_id))
             .eq("status", "following")
+            .limit(1)
             .execute()
         )
-        if not res.data:
-            return False
-        current = res.data[0].get("follows_back", False)
-        return current
+        return bool(res.data and res.data[0].get("follows_back", False))
 
     def get_stats_today(self, account_id) -> dict:
-        today = datetime.now(timezone.utc).date().isoformat()
+        start, end = _local_day_bounds()
         logs = (
             self.sb.table("ig_action_logs")
-            .select("action, success")
+            .select("action,success,detail")
             .eq("account_id", account_id)
-            .gte("executed_at", today)
+            .gte("executed_at", start)
+            .lt("executed_at", end)
             .execute()
         ).data or []
 
-        stats = {"follow": 0, "unfollow": 0, "story_view": 0, "error": 0}
+        stats = {
+            "follow": 0,
+            "unfollow": 0,
+            "story_view": 0,
+            "follow_back_detected": 0,
+            "error": 0,
+        }
         for log in logs:
-            action = log["action"]
-            if action in stats:
-                stats[action] += 1
-            elif not log["success"]:
+            if not log.get("success", True):
                 stats["error"] += 1
+                continue
+            action = log.get("action")
+            if action == "story_view":
+                stats["story_view"] += _story_count(log.get("detail"))
+            elif action in stats:
+                stats[action] += 1
         return stats

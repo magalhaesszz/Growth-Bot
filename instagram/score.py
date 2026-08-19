@@ -4,16 +4,12 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileScorer:
-    """
-    Calcula score 0-100 de um perfil antes de seguir.
-    Critérios: tem foto, tem posts, ratio seguidores/seguindo,
-    conta não privada (ou privada aceitável), bio preenchida.
-    """
+    """Calcula score 0-100 sem transformar dados ausentes em sinais positivos."""
 
     def __init__(
         self,
         min_posts: int = 3,
-        max_following_ratio: float = 10.0,  # seguindo/seguidores máximo
+        max_following_ratio: float = 10.0,
         require_photo: bool = True,
     ):
         self.min_posts = min_posts
@@ -21,71 +17,66 @@ class ProfileScorer:
         self.require_photo = require_photo
 
     def score(self, profile: dict) -> int:
-        """Retorna score de 0 a 100."""
         points = 0
 
-        # Tem foto de perfil (20 pts)
         if profile.get("profile_pic_url"):
             points += 20
 
-        # Posts mínimos (20 pts)
-        media_count = profile.get("media_count", 0)
-        if media_count >= self.min_posts:
-            points += 20
-        elif media_count > 0:
-            points += 10
+        media_count = profile.get("media_count")
+        if isinstance(media_count, (int, float)):
+            if media_count >= self.min_posts:
+                points += 20
+            elif media_count > 0:
+                points += 10
 
-        # Ratio seguidores/seguindo (30 pts)
-        followers = profile.get("follower_count", 0)
-        following = profile.get("following_count", 1)
-        ratio = following / max(followers, 1)
-        if ratio <= 2.0:
-            points += 30
-        elif ratio <= 5.0:
-            points += 20
-        elif ratio <= self.max_following_ratio:
-            points += 10
+        followers = profile.get("follower_count")
+        following = profile.get("following_count")
+        if isinstance(followers, (int, float)) and isinstance(
+            following, (int, float)
+        ):
+            ratio = following / max(followers, 1)
+            if ratio <= 2.0:
+                points += 30
+            elif ratio <= 5.0:
+                points += 20
+            elif ratio <= self.max_following_ratio:
+                points += 10
 
-        # Conta não privada (15 pts)
-        if not profile.get("is_private", True):
+        is_private = profile.get("is_private")
+        if is_private is False:
             points += 15
 
-        # Tem nome completo (15 pts — sinal de conta real)
-        if profile.get("full_name", "").strip():
+        if str(profile.get("full_name", "") or "").strip():
             points += 15
 
         return min(points, 100)
 
     def passes(self, profile: dict, min_score: int) -> bool:
-        s = self.score(profile)
+        score = self.score(profile)
         username = profile.get("username", "?")
-        logger.debug(f"Score @{username}: {s} (mínimo: {min_score})")
-        return s >= min_score
+        logger.debug("Score @%s: %s (minimo=%s)", username, score, min_score)
+        return score >= min_score
 
 
 class BlacklistFilter:
-    """Verifica se um perfil deve ser ignorado pela blacklist."""
-
     def __init__(self, terms: list[str]):
-        # termos em lower case para comparação
-        self.keywords = [t.lower() for t in terms if t]
+        self.keywords = [term.lower() for term in terms if term]
 
     def is_blocked(self, profile: dict) -> bool:
-        username = profile.get("username", "").lower()
-        full_name = profile.get("full_name", "").lower()
-
-        for kw in self.keywords:
-            if kw in username or kw in full_name:
-                logger.debug(f"@{username} bloqueado pela blacklist (termo: '{kw}')")
+        username = str(profile.get("username", "") or "").lower()
+        full_name = str(profile.get("full_name", "") or "").lower()
+        for keyword in self.keywords:
+            if keyword in username or keyword in full_name:
+                logger.debug(
+                    "@%s bloqueado pela blacklist (termo=%s)", username, keyword
+                )
                 return True
         return False
 
 
 class WhitelistFilter:
-    """Verifica se um perfil está na whitelist (nunca deixar de seguir)."""
-
     def __init__(self, usernames: list[str]):
         self.usernames = {u.lower().lstrip("@") for u in usernames}
 
     def is_protected(self, username: str) -> bool:
-        return username.lower() in self.usernames
+        return username.lower().lstrip("@") in self.usernames

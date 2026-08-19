@@ -1,14 +1,12 @@
-import re
 import logging
-import time
-import random
-from instagrapi.exceptions import UserNotFound, PrivateError
+import re
+
+from instagrapi.exceptions import PrivateError, UserNotFound
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_username(url_or_handle: str) -> str:
-    """Extrai username de URL ou @handle."""
     url_or_handle = url_or_handle.strip().rstrip("/")
     match = re.search(r"instagram\.com/([^/?]+)", url_or_handle)
     if match:
@@ -22,16 +20,15 @@ class Scraper:
         self.username = ig_client.username
 
     def resolve_page(self, url_or_handle: str) -> dict | None:
-        """Resolve URL/handle para user_id + username da página."""
         username = _extract_username(url_or_handle)
         try:
             info = self.cl.user_info_by_username(username)
             return {"user_id": str(info.pk), "username": info.username}
         except UserNotFound:
-            logger.error(f"Página não encontrada: {username}")
+            logger.error("Pagina nao encontrada: %s", username)
             return None
-        except Exception as e:
-            logger.error(f"Erro ao resolver página {username}: {e}")
+        except Exception as exc:
+            logger.error("Erro ao resolver pagina %s: %s", username, exc)
             return None
 
     def get_followers(
@@ -39,51 +36,71 @@ class Scraper:
         page_user_id: str,
         page_username: str,
         limit: int = 200,
-        already_following: set = None,
+        already_following: set | None = None,
+        stop_event=None,
     ) -> list[dict]:
-        """
-        Extrai seguidores de uma página-alvo.
-        Retorna lista de dicts com user_id e username.
-        """
+        """Extrai seguidores sem inventar metricas ausentes de ``UserShort``."""
         already_following = already_following or set()
-        followers = []
+        followers: list[dict] = []
 
         try:
-            logger.info(f"[{self.username}] Raspando seguidores de @{page_username} (limite: {limit})")
-
-            # Tentar user_followers_v1 (Mobile API) — funciona com sessão web
+            logger.info(
+                "[%s] Raspando seguidores de @%s (limite=%s)",
+                self.username,
+                page_username,
+                limit,
+            )
             users = []
             try:
                 users = self.cl.user_followers_v1(page_user_id, amount=limit)
-            except Exception as e1:
-                logger.warning(f"[{self.username}] user_followers_v1 falhou: {e1} — tentando user_followers")
+            except Exception as first_exc:
+                logger.warning(
+                    "[%s] user_followers_v1 falhou (%s); tentando user_followers",
+                    self.username,
+                    type(first_exc).__name__,
+                )
                 try:
                     raw = self.cl.user_followers(page_user_id, amount=limit)
                     users = list(raw.values())
-                except Exception as e2:
-                    logger.error(f"[{self.username}] user_followers também falhou: {e2}")
+                except Exception as second_exc:
+                    logger.error(
+                        "[%s] user_followers tambem falhou: %s",
+                        self.username,
+                        type(second_exc).__name__,
+                    )
 
             for user in users:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 uid = str(user.pk)
                 if uid in already_following:
                     continue
-                # UserShort nao tem follower_count — usar getattr com default
-                followers.append({
-                    "user_id": uid,
-                    "username": user.username,
-                    "full_name": getattr(user, "full_name", ""),
-                    "is_private": getattr(user, "is_private", False),
-                    "follower_count": getattr(user, "follower_count", 0),
-                    "following_count": getattr(user, "following_count", 0),
-                    "media_count": getattr(user, "media_count", 0),
-                    "profile_pic_url": str(user.profile_pic_url) if getattr(user, "profile_pic_url", None) else None,
-                })
-                time.sleep(random.uniform(0.5, 1.5))
+                followers.append(
+                    {
+                        "user_id": uid,
+                        "username": user.username,
+                        "full_name": getattr(user, "full_name", "") or "",
+                        "is_private": getattr(user, "is_private", None),
+                        "follower_count": getattr(user, "follower_count", None),
+                        "following_count": getattr(user, "following_count", None),
+                        "media_count": getattr(user, "media_count", None),
+                        "profile_pic_url": (
+                            str(user.profile_pic_url)
+                            if getattr(user, "profile_pic_url", None)
+                            else None
+                        ),
+                    }
+                )
 
-            logger.info(f"[{self.username}] {len(followers)} perfis raspados de @{page_username}")
+            logger.info(
+                "[%s] %s perfis raspados de @%s",
+                self.username,
+                len(followers),
+                page_username,
+            )
         except PrivateError:
-            logger.warning(f"@{page_username} é privada — impossível raspar seguidores.")
-        except Exception as e:
-            logger.error(f"Erro ao raspar @{page_username}: {e}")
+            logger.warning("@%s e privada; seguidores indisponiveis.", page_username)
+        except Exception as exc:
+            logger.error("Erro ao raspar @%s: %s", page_username, exc)
 
         return followers

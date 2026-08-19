@@ -1,8 +1,8 @@
 import os
 import tempfile
+
 from dotenv import load_dotenv
 
-# load_dotenv funciona localmente; no Discloud as vars já estão no ambiente
 load_dotenv()
 
 # ─── Telegram ────────────────────────────────────────────────
@@ -13,14 +13,17 @@ TELEGRAM_OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ─── Criptografia de sessões ─────────────────────────────────
+# ─── Criptografia de sessoes ─────────────────────────────────
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
 
 # ─── Video API ───────────────────────────────────────────────
 VIDEO_API_URL = os.getenv("VIDEO_API_URL", "").rstrip("/")
 VIDEO_API_SECRET = os.getenv("VIDEO_API_SECRET", "")
+VIDEO_MAX_FILE_MB = max(1, int(os.getenv("VIDEO_MAX_FILE_MB", "45")))
+VIDEO_MAX_BATCH_MB = max(VIDEO_MAX_FILE_MB, int(os.getenv("VIDEO_MAX_BATCH_MB", "120")))
+VIDEO_SETTINGS_REMOTE = os.getenv("VIDEO_SETTINGS_REMOTE", "true").strip().lower() == "true"
 
-# ─── Limites padrão ──────────────────────────────────────────
+# ─── Limites padrao ──────────────────────────────────────────
 DEFAULT_DAILY_FOLLOWS = 40
 DEFAULT_DAILY_UNFOLLOWS = 40
 DEFAULT_DELAY_MIN = 30
@@ -28,34 +31,32 @@ DEFAULT_DELAY_MAX = 90
 DEFAULT_UNFOLLOW_AFTER_DAYS = 5
 DEFAULT_SCORE_MIN = 50
 
-# ─── Janela de operação padrão ───────────────────────────────
+# ─── Janela de operacao padrao ───────────────────────────────
 DEFAULT_HOUR_START = 8
 DEFAULT_HOUR_END = 22
 
 # ─── Aquecimento progressivo ─────────────────────────────────
-WARMUP_SCHEDULE = [5, 10, 20, 30, 40]  # follows por dia (dias 1-5+)
+WARMUP_SCHEDULE = [5, 10, 20, 30, 40]
 
 # ─── Detector de risco ───────────────────────────────────────
-RISK_ERROR_RATE_THRESHOLD = 0.15   # 15% de erros → pausa automática
+RISK_ERROR_RATE_THRESHOLD = 0.15
 RISK_MIN_ACTIONS_TO_EVAL = 10
-ANOMALY_ZERO_ACTION_HOURS = 2      # horas sem ação dentro da janela → alerta
+ANOMALY_ZERO_ACTION_HOURS = 2
 
-# ─── Fila / retry ────────────────────────────────────────────
+# A fila antiga continua disponivel para compatibilidade/inspecao. Acoes do
+# Instagram nao sao retryadas cegamente: side-effects incertos podem duplicar.
 QUEUE_MAX_RETRIES = 3
-QUEUE_BACKOFF_BASE = 60            # segundos base para backoff exponencial
+QUEUE_BACKOFF_BASE = 60
 
-# ─── Proxy Instagram (opcional — usar se IP do servidor for bloqueado) ──
-# Formato: http://usuario:senha@host:porta  ou  socks5://host:porta
-INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "").strip()  # vazio = conexão direta
+# ─── Proxy Instagram ─────────────────────────────────────────
+INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "").strip()
 INSTAGRAM_USE_PROXY = os.getenv("INSTAGRAM_USE_PROXY", "false").strip().lower() == "true"
 INSTAGRAM_COUNTRY = os.getenv("INSTAGRAM_COUNTRY", "BR")
 INSTAGRAM_COUNTRY_CODE = int(os.getenv("INSTAGRAM_COUNTRY_CODE", "55"))
 INSTAGRAM_LOCALE = os.getenv("INSTAGRAM_LOCALE", "pt_BR")
 INSTAGRAM_TIMEZONE_OFFSET = int(os.getenv("INSTAGRAM_TIMEZONE_OFFSET", "-10800"))
 
-# ─── Pasta de sessões ────────────────────────────────────────
-# /tmp é gravável tanto no Discloud quanto localmente.
-# Backup criptografado das sessões fica no Supabase (persistente).
+# ─── Pasta de sessoes ────────────────────────────────────────
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "").strip() or os.path.join(
     tempfile.gettempdir(), "growth-bot-sessions"
 )
@@ -91,5 +92,7 @@ def validate_config() -> None:
         raise RuntimeError("VIDEO_API_URL e VIDEO_API_SECRET devem ser configurados juntos")
     if VIDEO_API_URL and not VIDEO_API_URL.startswith("https://"):
         raise RuntimeError("VIDEO_API_URL deve usar HTTPS")
+    if VIDEO_MAX_BATCH_MB < VIDEO_MAX_FILE_MB:
+        raise RuntimeError("VIDEO_MAX_BATCH_MB deve ser >= VIDEO_MAX_FILE_MB")
     if INSTAGRAM_USE_PROXY and not INSTAGRAM_PROXY:
         raise RuntimeError("INSTAGRAM_USE_PROXY=true exige INSTAGRAM_PROXY configurada")

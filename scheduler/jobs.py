@@ -1,245 +1,411 @@
 import asyncio
 import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import WARMUP_SCHEDULE, TELEGRAM_OWNER_ID
+from config import TELEGRAM_OWNER_ID
 from database.accounts import AccountsDB
 from database.operations import DB
+from database.state import BotStateDB
 from instagram.client import InstagramClient
-from instagram.scraper import Scraper
 from instagram.follower import Follower
-from instagram.unfollower import Unfollower
-from instagram.stories import StoriesViewer
-from instagram.score import ProfileScorer, BlacklistFilter, WhitelistFilter
 from instagram.risk_detector import risk_detector
-from scheduler.warmup import advance_all_warmups, get_warmup_limit
+from instagram.score import BlacklistFilter, ProfileScorer, WhitelistFilter
+from instagram.scraper import Scraper
+from instagram.stories import StoriesViewer
+from instagram.unfollower import Unfollower
 from scheduler.anomaly import check_all_anomalies
+from scheduler.warmup import advance_all_warmups, get_warmup_limit
 
 logger = logging.getLogger(__name__)
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
-# Referência ao app Telegram (injetada em setup_scheduler)
 _telegram_app = None
+
+_ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+
+_MANUAL_MODE = False
+_MANUAL_TASK: asyncio.Task | None = None
+_MANUAL_STOP_EVENT = threading.Event()
+_MANUAL_WAKE_EVENT: asyncio.Event | None = None
+
+
+def _get_account_lock(username: str) -> threading.Lock:
+    key = username.casefold()
+    with _ACCOUNT_LOCKS_GUARD:
+        lock = _ACCOUNT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ACCOUNT_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _account_guard(username: str):
+    """Serializa todas as acoes Instagram de uma mesma conta no processo."""
+    lock = _get_account_lock(username)
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
 
 
 async def _notify(message: str):
-    """Envia mensagem ao dono via Telegram."""
-    if _telegram_app:
-        try:
-            await _telegram_app.bot.send_message(
-                chat_id=TELEGRAM_OWNER_ID,
-                text=message,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Erro ao enviar notificação Telegram: {e}")
+    if not _telegram_app:
+        return
+    try:
+        await _telegram_app.bot.send_message(
+            chat_id=TELEGRAM_OWNER_ID,
+            text=message,
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("Erro ao enviar notificacao Telegram: %s", exc)
 
 
 def _get_daily_limit(account: dict) -> int:
-    warmup_day = account.get("warmup_day", 0)
+    warmup_day = int(account.get("warmup_day", 0) or 0)
     if warmup_day > 0:
         return get_warmup_limit(warmup_day)
-    return account.get("daily_follows", 40)
+    return int(account.get("daily_follows", 40) or 0)
 
 
-LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
-
-
-def _run_follow_job_sync(ignore_schedule: bool = False) -> list[str]:
-    notifications: list[str] = []
-    accounts_db = AccountsDB()
-    db = DB()
-    accounts = accounts_db.list_active_accounts()
-
-    for acc in accounts:
-        username = acc["username"]
-
-        if risk_detector.is_paused(username):
-            logger.warning(f"[{username}] Pausada — pulando follow job.")
-            continue
-
-        if not ignore_schedule:
-            now_hour = datetime.now(LOCAL_TZ).hour
-            if not (acc["hour_start"] <= now_hour < acc["hour_end"]):
-                continue
-
-        ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
-        # Restaurar sessão salva — SEMPRE validar, mesmo se existir backup
-        from database.accounts import AccountsDB as _ADB
-        _sess = _ADB().load_session_backup(username)
-        sessao_valida = False
-        if _sess:
-            ig.load_session_from_data(_sess)
-            sessao_valida = ig.is_logged_in()
-        if not sessao_valida:
-            result = ig.login()
-            if result != "ok":
-                risk_detector.notify_session_expired(username)
-                notifications.append(
-                    f"🔒 *@{username}* — sessão inválida/revogada.\n"
-                    f"Use `/conta_sessao @{username} SESSIONID` para reconectar."
-                )
-                continue
-
-        targets = db.list_targets(acc["id"])
-        if not targets:
-            logger.info(f"[{username}] Sem alvos cadastrados.")
-            continue
-
-        already_following = db.get_already_following_ids(acc["id"])
-        bl_filter = BlacklistFilter(db.get_blacklist(acc["id"]))
-        scorer = ProfileScorer()
-        follower = Follower(ig, risk_detector, scorer, bl_filter)
-
-        configured_limit = _get_daily_limit(acc)
-        already_today = db.count_today_follows(acc["id"])
-        daily_limit = max(0, configured_limit - already_today)
-        if daily_limit <= 0 and not ignore_schedule:
-            logger.info("[%s] Limite diário total já atingido.", username)
-            continue
-        elif daily_limit <= 0 and ignore_schedule:
-            # Modo manual: reseta o limite parcial para continuar
-            daily_limit = configured_limit
-        campaign = db.get_active_campaign(acc["id"])
-        campaign_id = campaign["id"] if campaign else None
-
-        total_followed = 0
-
-        for target in targets:
-            scraper = Scraper(ig)
-
-            if not target.get("page_user_id"):
-                page = scraper.resolve_page(target["page_url"])
-                if not page:
-                    continue
-                db.sb.table("ig_targets").update({
-                    "page_username": page["username"],
-                    "page_user_id": page["user_id"],
-                }).eq("id", target["id"]).execute()
-                target.update(page)
-
-            profiles = scraper.get_followers(
-                target["page_user_id"],
-                target["page_username"],
-                limit=150,
-                already_following=already_following,
-            )
-
-            def on_follow(uname, uid, _campaign_id=campaign_id, _acc=acc):
-                db.add_followed(_acc["id"], uid, uname, _campaign_id)
-                already_following.add(str(uid))
-                db.log_action(_acc["id"], "follow", uname, success=True)
-                if _campaign_id:
-                    db.update_campaign_stats(_campaign_id, follows=1)
-                accounts_db.update_last_active(_acc["username"])
-
-            remaining_limit = max(0, daily_limit - total_followed)
-            if remaining_limit <= 0:
-                break
-            result = follower.follow_batch(
-                profiles,
-                daily_limit=remaining_limit,
-                min_score=acc.get("score_min", 50),
-                delay_min=acc.get("delay_min", 30),
-                delay_max=acc.get("delay_max", 90),
-                on_success=on_follow,
-            )
-            total_followed += result["followed"]
-
-            db.update_target_scraped(target["id"], result["followed"])
-
-            if risk_detector.is_paused(username):
-                break
-
-        # Stories nos perfis seguidos recentemente
-        if not risk_detector.is_paused(username):
-            recent_ids = list(db.get_already_following_ids(acc["id"]))[:30]
-            viewer = StoriesViewer(ig, risk_detector)
-            story_result = viewer.view_stories_for_users(
-                recent_ids, max_per_run=20, delay_min=5, delay_max=15
-            )
-            db.log_action(acc["id"], "story_view", detail=f"Vistos: {story_result['viewed']}")
-
-        logger.info(f"[{username}] Follow job finalizado — {total_followed} follows.")
-
-    return notifications
-
-
-async def run_follow_job(ignore_schedule: bool = False):
-    notifications = await asyncio.to_thread(_run_follow_job_sync, ignore_schedule)
-    # Auto-unfollow quem seguiu de volta
-    await asyncio.to_thread(_auto_unfollow_follow_backs_sync)
-    for message in notifications:
-        await _notify(message)
-
-
-def _run_unfollow_job_sync():
-    accounts_db = AccountsDB()
-    db = DB()
-    accounts = accounts_db.list_active_accounts()
-
-    for acc in accounts:
-        username = acc["username"]
-
-        if risk_detector.is_paused(username):
-            continue
-
-        candidates = db.get_unfollow_candidates(acc["id"], acc.get("unfollow_after_days", 5))
-        if not candidates:
-            continue
-
-        ig = InstagramClient(username, acc["password"], acc.get("fingerprint"))
-        result = ig.login()
-        if result != "ok":
-            continue
-
-        wl = WhitelistFilter(db.get_whitelist(acc["id"]))
-        unfollower = Unfollower(ig, risk_detector, wl)
-
-        campaign = db.get_active_campaign(acc["id"])
-        campaign_id = campaign["id"] if campaign else None
-
-        def on_unfollow(uname, uid, kept: bool, _acc=acc, _campaign_id=campaign_id):
-            if kept:
-                db.mark_follows_back(_acc["id"], uname)
-                db.log_action(_acc["id"], "follow_back_detected", uname)
-                if _campaign_id:
-                    db.update_campaign_stats(_campaign_id, follow_backs=1)
-            else:
-                db.mark_unfollowed(_acc["id"], uname)
-                db.log_action(_acc["id"], "unfollow", uname)
-                if _campaign_id:
-                    db.update_campaign_stats(_campaign_id, unfollows=1)
-
-        unfollower.unfollow_batch(
-            candidates,
-            daily_limit=max(
-                0,
-                acc.get("daily_unfollows", 40)
-                - db.count_today_unfollows(acc["id"]),
-            ),
-            delay_min=acc.get("delay_min", 30),
-            delay_max=acc.get("delay_max", 90),
-            on_success=on_unfollow,
-            policy=acc.get("unfollow_policy", "keep_follow_backs"),
+def _backup_current_session(accounts_db: AccountsDB, ig: InstagramClient) -> None:
+    try:
+        data = ig.get_session_data()
+        if data:
+            accounts_db.save_session_backup(ig.username, data)
+    except Exception as exc:
+        logger.warning(
+            "[%s] Nao foi possivel atualizar backup de sessao: %s",
+            ig.username,
+            type(exc).__name__,
         )
 
 
-async def run_unfollow_job():
-    await asyncio.to_thread(_run_unfollow_job_sync)
+def _authenticate_account(acc: dict, accounts_db: AccountsDB) -> InstagramClient | None:
+    """Restaura a sessao, valida ao vivo e so entao tenta senha como fallback."""
+    username = acc["username"]
+    ig = InstagramClient(
+        username,
+        acc.get("password", ""),
+        acc.get("fingerprint"),
+    )
+
+    session = accounts_db.load_session_backup(username)
+    if session:
+        try:
+            ig.load_session_from_data(session)
+            if ig.is_logged_in():
+                status = risk_detector.get_status(username)
+                if status["is_paused"] and status["pause_reason"] == "Sessão expirada":
+                    risk_detector.resume(username)
+                return ig
+        except Exception as exc:
+            logger.warning(
+                "[%s] Backup de sessao nao validou: %s",
+                username,
+                type(exc).__name__,
+            )
+
+    password = acc.get("password", "") or ""
+    if password:
+        result = ig.login()
+        if result == "ok":
+            _backup_current_session(accounts_db, ig)
+            return ig
+        logger.warning("[%s] Fallback de login retornou %s", username, result)
+
+    risk_detector.notify_session_expired(username)
+    return None
+
+
+def _run_follow_job_sync(ignore_schedule: bool = False, stop_event=None) -> dict:
+    accounts_db = AccountsDB()
+    db = DB()
+    summary = {"followed": 0, "stories": 0, "accounts": 0}
+
+    for acc in accounts_db.list_active_accounts():
+        if stop_event is not None and stop_event.is_set():
+            break
+        username = acc["username"]
+
+        with _account_guard(username) as acquired:
+            if not acquired:
+                logger.info("[%s] Outro job ja esta usando a conta; pulando.", username)
+                continue
+            if risk_detector.is_paused(username):
+                logger.warning("[%s] Pausada por risco; follow bloqueado.", username)
+                continue
+
+            if not ignore_schedule:
+                now_hour = datetime.now(LOCAL_TZ).hour
+                if not (int(acc["hour_start"]) <= now_hour < int(acc["hour_end"])):
+                    continue
+
+            configured_limit = _get_daily_limit(acc)
+            already_today = db.count_today_follows(acc["id"])
+            run_limit = max(0, configured_limit - already_today)
+            if run_limit <= 0:
+                logger.info(
+                    "[%s] Limite diario ja atingido (%s/%s).",
+                    username,
+                    already_today,
+                    configured_limit,
+                )
+                continue
+
+            ig = _authenticate_account(acc, accounts_db)
+            if not ig:
+                continue
+
+            targets = db.list_targets(acc["id"])
+            if not targets:
+                logger.info("[%s] Sem alvos cadastrados.", username)
+                continue
+
+            already_following = db.get_already_following_ids(acc["id"])
+            follower = Follower(
+                ig,
+                risk_detector,
+                ProfileScorer(),
+                BlacklistFilter(db.get_blacklist(acc["id"])),
+            )
+            campaign = db.get_active_campaign(acc["id"])
+            campaign_id = campaign["id"] if campaign else None
+            total_followed = 0
+
+            for target in targets:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if total_followed >= run_limit or risk_detector.is_paused(username):
+                    break
+
+                scraper = Scraper(ig)
+                if not target.get("page_user_id"):
+                    page = scraper.resolve_page(target["page_url"])
+                    if not page:
+                        continue
+                    db.sb.table("ig_targets").update(
+                        {
+                            "page_username": page["username"],
+                            "page_user_id": page["user_id"],
+                        }
+                    ).eq("id", target["id"]).execute()
+                    target.update(page)
+
+                profiles = scraper.get_followers(
+                    target["page_user_id"],
+                    target["page_username"],
+                    limit=150,
+                    already_following=already_following,
+                    stop_event=stop_event,
+                )
+                db.update_target_scraped(target["id"], len(profiles))
+
+                def on_follow(uname, uid, _acc=acc, _campaign_id=campaign_id):
+                    db.add_followed(_acc["id"], uid, uname, _campaign_id)
+                    already_following.add(str(uid))
+                    db.log_action(_acc["id"], "follow", uname, success=True)
+                    if _campaign_id:
+                        db.update_campaign_stats(_campaign_id, follows=1)
+                    accounts_db.update_last_active(_acc["username"])
+
+                result = follower.follow_batch(
+                    profiles,
+                    daily_limit=run_limit,
+                    min_score=int(acc.get("score_min", 50)),
+                    delay_min=int(acc.get("delay_min", 30)),
+                    delay_max=int(acc.get("delay_max", 90)),
+                    on_success=on_follow,
+                    stop_event=stop_event,
+                )
+                total_followed += result["followed"]
+                if result.get("stopped"):
+                    break
+
+            if (
+                not risk_detector.is_paused(username)
+                and not (stop_event is not None and stop_event.is_set())
+            ):
+                recent_ids = list(db.get_already_following_ids(acc["id"]))[:30]
+                if recent_ids:
+                    viewer = StoriesViewer(ig, risk_detector)
+                    story_result = viewer.view_stories_for_users(
+                        recent_ids,
+                        max_per_run=20,
+                        delay_min=5,
+                        delay_max=15,
+                        stop_event=stop_event,
+                    )
+                    if story_result["viewed"]:
+                        db.log_action(
+                            acc["id"],
+                            "story_view",
+                            detail=str(story_result["viewed"]),
+                            success=True,
+                        )
+                    if story_result["errors"]:
+                        db.log_action(
+                            acc["id"],
+                            "error",
+                            detail=f"story_errors:{story_result['errors']}",
+                            success=False,
+                        )
+                    summary["stories"] += story_result["viewed"]
+
+            _backup_current_session(accounts_db, ig)
+            summary["followed"] += total_followed
+            summary["accounts"] += 1
+            logger.info(
+                "[%s] Follow job finalizado — %s follows.", username, total_followed
+            )
+
+    return summary
+
+
+async def run_follow_job(ignore_schedule: bool = False, stop_event=None) -> dict:
+    return await asyncio.to_thread(_run_follow_job_sync, ignore_schedule, stop_event)
+
+
+def _run_unfollow_job_sync() -> dict:
+    accounts_db = AccountsDB()
+    db = DB()
+    summary = {"unfollowed": 0}
+
+    for acc in accounts_db.list_active_accounts():
+        username = acc["username"]
+        with _account_guard(username) as acquired:
+            if not acquired or risk_detector.is_paused(username):
+                continue
+
+            remaining = max(
+                0,
+                int(acc.get("daily_unfollows", 40))
+                - db.count_today_unfollows(acc["id"]),
+            )
+            if remaining <= 0:
+                continue
+
+            candidates = db.get_unfollow_candidates(
+                acc["id"], int(acc.get("unfollow_after_days", 5))
+            )
+            if not candidates:
+                continue
+
+            ig = _authenticate_account(acc, accounts_db)
+            if not ig:
+                continue
+            unfollower = Unfollower(
+                ig,
+                risk_detector,
+                WhitelistFilter(db.get_whitelist(acc["id"])),
+            )
+            campaign = db.get_active_campaign(acc["id"])
+            campaign_id = campaign["id"] if campaign else None
+            known_follow_back = {
+                str(item.get("target_username", "")): bool(item.get("follows_back"))
+                for item in candidates
+            }
+            policy = acc.get("unfollow_policy", "keep_follow_backs")
+
+            def on_unfollow(uname, uid, kept: bool, _acc=acc):
+                if kept:
+                    # Registra a conversao apenas na primeira confirmacao.
+                    if policy == "keep_follow_backs" and not known_follow_back.get(uname):
+                        db.mark_follows_back(_acc["id"], uname)
+                        db.log_action(
+                            _acc["id"], "follow_back_detected", uname, success=True
+                        )
+                        known_follow_back[uname] = True
+                        if campaign_id:
+                            db.update_campaign_stats(campaign_id, follow_backs=1)
+                    return
+                db.mark_unfollowed(_acc["id"], uname)
+                db.log_action(_acc["id"], "unfollow", uname, success=True)
+                if campaign_id:
+                    db.update_campaign_stats(campaign_id, unfollows=1)
+
+            result = unfollower.unfollow_batch(
+                candidates,
+                daily_limit=remaining,
+                delay_min=int(acc.get("delay_min", 30)),
+                delay_max=int(acc.get("delay_max", 90)),
+                on_success=on_unfollow,
+                policy=policy,
+            )
+            _backup_current_session(accounts_db, ig)
+            summary["unfollowed"] += result["unfollowed"]
+
+    return summary
+
+
+async def run_unfollow_job() -> dict:
+    return await asyncio.to_thread(_run_unfollow_job_sync)
+
+
+def _auto_unfollow_follow_backs_sync() -> list[str]:
+    accounts_db = AccountsDB()
+    db = DB()
+    messages: list[str] = []
+
+    for acc in accounts_db.list_active_accounts():
+        username = acc["username"]
+        with _account_guard(username) as acquired:
+            if not acquired or risk_detector.is_paused(username):
+                continue
+            remaining = max(
+                0,
+                int(acc.get("daily_unfollows", 40))
+                - db.count_today_unfollows(acc["id"]),
+            )
+            if remaining <= 0:
+                continue
+            ig = _authenticate_account(acc, accounts_db)
+            if not ig:
+                continue
+            unfollower = Unfollower(
+                ig,
+                risk_detector,
+                WhitelistFilter(db.get_whitelist(acc["id"])),
+            )
+            count = unfollower.auto_unfollow_follow_backs(
+                acc["id"],
+                db,
+                daily_limit=remaining,
+                delay_min=int(acc.get("delay_min", 30)),
+                delay_max=int(acc.get("delay_max", 90)),
+                max_checks=50,
+            )
+            _backup_current_session(accounts_db, ig)
+            if count:
+                messages.append(
+                    f"🔄 @{username}: {count} auto-unfollow(s) de follow-backs confirmados."
+                )
+    return messages
+
+
+async def run_auto_unfollow_follow_backs():
+    for message in await asyncio.to_thread(_auto_unfollow_follow_backs_sync):
+        await _notify(message)
 
 
 def _run_session_backup_job_sync():
     accounts_db = AccountsDB()
     for acc in accounts_db.list_active_accounts():
-        ig = InstagramClient(acc["username"], acc["password"], acc.get("fingerprint"))
-        data = ig.get_session_data()
-        if data:
-            accounts_db.save_session_backup(acc["username"], data)
-    logger.info("Backup de sessões concluído.")
+        ig = InstagramClient(
+            acc["username"], acc.get("password", ""), acc.get("fingerprint")
+        )
+        _backup_current_session(accounts_db, ig)
+    logger.info("Backup de sessoes concluido.")
 
 
 async def run_session_backup_job():
@@ -270,271 +436,307 @@ async def run_anomaly_check():
     await check_all_anomalies(risk_detector, notify_fn=_notify)
 
 
-
-# Modo manual
-_MANUAL_MODE: bool = False
-_MANUAL_TASK = None
-
-
-def _auto_unfollow_follow_backs_sync():
-    """Checa quem seguiu de volta e faz unfollow automatico."""
-    try:
-        from database.accounts import AccountsDB
-        from database.operations import DB
-        from instagram.client import InstagramClient
-        from instagram.unfollower import Unfollower
-        from instagram.score import WhitelistFilter
-
-        adb = AccountsDB()
-        db  = DB()
-        accounts = adb.list_active_accounts()
-
-        for acc in accounts:
-            username = acc["username"]
-            ig = InstagramClient(username, acc.get("password",""), acc.get("fingerprint"))
-            sess = adb.load_session_backup(username)
-            sessao_valida = False
-            if sess:
-                ig.load_session_from_data(sess)
-                sessao_valida = ig.is_logged_in()
-            if not sessao_valida:
-                risk_detector.notify_session_expired(username)
-                continue
-
-            wl = WhitelistFilter(db.get_whitelist(acc["id"]))
-            unfollower = Unfollower(ig, risk_detector, wl)
-            count = unfollower.auto_unfollow_follow_backs(
-                acc["id"], db,
-                daily_limit=acc.get("daily_unfollows", 50),
-                delay_min=acc.get("delay_min", 30),
-                delay_max=acc.get("delay_max", 90),
-            )
-            if count > 0:
-                import asyncio
-                asyncio.run_coroutine_threadsafe(
-                    _notify(f"🔄 @{username}: {count} auto-unfollows (seguiram de volta)"),
-                    asyncio.get_event_loop()
-                )
-    except Exception as e:
-        logger.error(f"Erro no auto_unfollow_follow_backs: {e}")
-
-
-
 async def run_weekly_report():
-    """Envia relatorio semanal (texto + grafico) para o dono via Telegram."""
     try:
-        from database.accounts import AccountsDB
         from reports.daily import ReportGenerator
-        adb = AccountsDB()
+
+        accounts_db = AccountsDB()
         reporter = ReportGenerator()
-        accounts = adb.list_active_accounts()
-        for acc in accounts:
-            text  = reporter.generate_text(acc["id"], acc["username"])
+        for acc in accounts_db.list_active_accounts():
+            text = reporter.generate_text(acc["id"], acc["username"])
             chart = reporter.generate_chart(acc["id"], acc["username"])
             if _telegram_app:
                 await _telegram_app.bot.send_photo(
                     chat_id=TELEGRAM_OWNER_ID,
                     photo=chart,
                     caption=text,
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
                 )
-    except Exception as e:
-        logger.error(f"Erro no relatorio semanal: {e}")
-
-async def run_manual_mode():
-    """Roda follow job continuamente até _MANUAL_MODE = False."""
-    global _MANUAL_MODE
-    logger.info("Modo manual iniciado.")
-    while _MANUAL_MODE:
-        await run_follow_job(ignore_schedule=True)
-        if _MANUAL_MODE:
-            import asyncio
-            await asyncio.sleep(10)  # pausa minima entre ciclos
-    logger.info("Modo manual encerrado.")
+    except Exception as exc:
+        logger.error("Erro no relatorio semanal: %s", exc)
 
 
-def _persist_manual_state(ativo: bool):
-    """Salva o estado do modo manual no banco — sobrevive a restart."""
-    try:
-        from database.operations import DB
-        DB().sb.table("bot_state").upsert({
-            "key": "manual_mode", "value": "true" if ativo else "false"
-        }).execute()
-    except Exception as e:
-        logger.warning(f"Erro ao persistir estado do modo manual: {e}")
+# ─── Modo manual ─────────────────────────────────────────────
+
+
+def _persist_manual_state(active: bool):
+    BotStateDB().set("manual_mode", "true" if active else "false")
 
 
 def _read_manual_state() -> bool:
+    return BotStateDB().get("manual_mode", "false") == "true"
+
+
+async def run_manual_mode():
+    global _MANUAL_MODE
+    logger.info("Modo manual iniciado.")
     try:
-        from database.operations import DB
-        res = DB().sb.table("bot_state").select("value").eq("key", "manual_mode").execute()
-        return bool(res.data and res.data[0]["value"] == "true")
-    except Exception:
-        return False
+        while _MANUAL_MODE and not _MANUAL_STOP_EVENT.is_set():
+            summary = await run_follow_job(
+                ignore_schedule=True, stop_event=_MANUAL_STOP_EVENT
+            )
+            if not _MANUAL_MODE or _MANUAL_STOP_EVENT.is_set():
+                break
+            delay = 10 if summary.get("followed", 0) else 60
+            if _MANUAL_WAKE_EVENT is None:
+                await asyncio.sleep(delay)
+                continue
+            try:
+                await asyncio.wait_for(_MANUAL_WAKE_EVENT.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            _MANUAL_WAKE_EVENT.clear()
+    finally:
+        logger.info("Modo manual encerrado.")
 
 
 async def start_manual_mode(telegram_app=None) -> bool:
-    """Liga o modo manual. Retorna False se já estiver rodando."""
-    global _MANUAL_MODE, _MANUAL_TASK, _telegram_app
+    global _MANUAL_MODE, _MANUAL_TASK, _telegram_app, _MANUAL_WAKE_EVENT
     if _MANUAL_MODE:
         return False
     if telegram_app:
         _telegram_app = telegram_app
     _MANUAL_MODE = True
+    _MANUAL_STOP_EVENT.clear()
+    _MANUAL_WAKE_EVENT = asyncio.Event()
     _persist_manual_state(True)
-    import asyncio
     _MANUAL_TASK = asyncio.create_task(run_manual_mode())
     return True
 
 
 async def stop_manual_mode() -> bool:
-    """Desliga o modo manual. Retorna False se não estiver rodando."""
     global _MANUAL_MODE, _MANUAL_TASK
     if not _MANUAL_MODE:
         return False
     _MANUAL_MODE = False
+    _MANUAL_STOP_EVENT.set()
     _persist_manual_state(False)
-    if _MANUAL_TASK and not _MANUAL_TASK.done():
-        _MANUAL_TASK.cancel()
+    if _MANUAL_WAKE_EVENT is not None:
+        _MANUAL_WAKE_EVENT.set()
+
+    task = _MANUAL_TASK
+    if task and not task.done():
+        try:
+            # Nao cancela a coroutine que aguarda to_thread: o Event interrompe
+            # delays e impede a proxima acao assim que a chamada atual terminar.
+            await asyncio.wait_for(asyncio.shield(task), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Modo manual recebeu stop; uma chamada de rede ainda esta encerrando."
+            )
     _MANUAL_TASK = None
     return True
 
 
 async def resume_manual_mode_if_needed(telegram_app=None):
-    """Chamado no startup — retoma o modo manual se estava ativo antes do restart."""
     if _read_manual_state():
-        logger.info("Modo manual estava ativo antes do restart — retomando...")
+        logger.info("Modo manual estava ativo antes do restart; retomando.")
         await start_manual_mode(telegram_app)
-        if _telegram_app:
-            try:
-                await _notify(
-                    "🔄 *Modo manual retomado automaticamente*\n\n"
-                    "O bot reiniciou e detectou que o modo manual estava ativo. "
-                    "Continuando de onde parou."
-                )
-            except Exception:
-                pass
+        await _notify(
+            "🔄 *Modo manual retomado automaticamente*\n\n"
+            "O bot reiniciou e retomou o estado salvo."
+        )
 
 
 def is_manual_mode() -> bool:
     return _MANUAL_MODE
 
-def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
-    global _telegram_app
-    _telegram_app = telegram_app
-    risk_detector.set_notify_fn(_notify)  # alerta proativo quando conta e pausada
 
-    scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+# ─── Unfollow externo seguro ─────────────────────────────────
 
-    # Follow — a cada 2h dentro da janela operacional
-    scheduler.add_job(run_follow_job, CronTrigger(minute="*/40"), id="follow_job")
 
-    # Unfollow — 1x por dia às 9h30
-    scheduler.add_job(run_unfollow_job, CronTrigger(hour=9, minute=30), id="unfollow_job")
+def _following_candidates(ig: InstagramClient, max_scan: int) -> list[dict]:
+    try:
+        raw = ig.api.user_following(ig.api.user_id, amount=max_scan)
+    except TypeError:
+        raw = ig.api.user_following(ig.api.user_id)
+    items = []
+    for uid, user in list(raw.items())[:max_scan]:
+        items.append(
+            {
+                "target_user_id": str(uid),
+                "target_username": str(getattr(user, "username", uid)),
+            }
+        )
+    return items
 
-    # Relatorio semanal — domingo as 20h
-    scheduler.add_job(run_weekly_report, CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekly_report")
 
-    # Backup de sessões — a cada 6h
-    scheduler.add_job(run_session_backup_job, CronTrigger(hour="*/6"), id="session_backup")
+def _count_external_nonfollowers_sync(username: str, max_scan: int = 200) -> dict:
+    accounts_db = AccountsDB()
+    db = DB()
+    acc = accounts_db.get_account(username)
+    if not acc:
+        return {"ok": False, "error": "Conta nao encontrada"}
 
-    # Aquecimento — avança dia às 23h59
-    scheduler.add_job(run_warmup_job, CronTrigger(hour=23, minute=59), id="warmup_job")
+    with _account_guard(username) as acquired:
+        if not acquired:
+            return {"ok": False, "error": "Conta ocupada por outro job"}
+        if risk_detector.is_paused(username):
+            return {"ok": False, "error": "Conta pausada por risco"}
+        ig = _authenticate_account(acc, accounts_db)
+        if not ig:
+            return {"ok": False, "error": "Sessao invalida"}
+        checker = Unfollower(
+            ig,
+            risk_detector,
+            WhitelistFilter(db.get_whitelist(acc["id"])),
+        )
+        candidates = _following_candidates(ig, max_scan)
+        nonfollowers = followbacks = unknown = protected = 0
+        for item in candidates:
+            if checker.whitelist.is_protected(item["target_username"]):
+                protected += 1
+                continue
+            relation = checker._follows_back(item["target_user_id"])
+            if relation is True:
+                followbacks += 1
+            elif relation is False:
+                nonfollowers += 1
+            else:
+                unknown += 1
+        return {
+            "ok": True,
+            "checked": len(candidates),
+            "nonfollowers": nonfollowers,
+            "followbacks": followbacks,
+            "unknown": unknown,
+            "protected": protected,
+        }
 
-    # Detector de anomalias — a cada 30 minutos
-    scheduler.add_job(run_anomaly_check, CronTrigger(minute="*/30"), id="anomaly_check")
 
-    # Relatório diário após o encerramento da janela padrão.
-    scheduler.add_job(run_daily_report_job, CronTrigger(hour=22, minute=15), id="daily_report")
+async def count_external_nonfollowers(username: str, max_scan: int = 200) -> dict:
+    return await asyncio.to_thread(_count_external_nonfollowers_sync, username, max_scan)
 
-    return scheduler
+
+def _run_unfollow_external_sync(username: str) -> dict:
+    accounts_db = AccountsDB()
+    db = DB()
+    acc = accounts_db.get_account(username)
+    if not acc:
+        return {"ok": False, "error": "Conta nao encontrada"}
+
+    with _account_guard(username) as acquired:
+        if not acquired:
+            return {"ok": False, "error": "Conta ocupada por outro job"}
+        if risk_detector.is_paused(username):
+            return {"ok": False, "error": "Conta pausada por risco"}
+
+        remaining = max(
+            0,
+            int(acc.get("daily_unfollows", 40))
+            - db.count_today_unfollows(acc["id"]),
+        )
+        if remaining <= 0:
+            return {"ok": True, "removed": 0, "limit_reached": True}
+
+        ig = _authenticate_account(acc, accounts_db)
+        if not ig:
+            return {"ok": False, "error": "Sessao invalida"}
+
+        max_scan = min(500, max(100, remaining * 8))
+        candidates = _following_candidates(ig, max_scan)
+        unfollower = Unfollower(
+            ig,
+            risk_detector,
+            WhitelistFilter(db.get_whitelist(acc["id"])),
+        )
+
+        def on_unfollow(uname, uid, kept: bool):
+            if kept:
+                return
+            db.mark_unfollowed(acc["id"], uname)
+            db.log_action(acc["id"], "unfollow", uname, "external_live_check", True)
+
+        # keep_follow_backs faz uma segunda verificacao ao vivo imediatamente
+        # antes de cada unfollow e falha fechado quando a API nao confirma.
+        result = unfollower.unfollow_batch(
+            candidates,
+            daily_limit=remaining,
+            delay_min=int(acc.get("delay_min", 30)),
+            delay_max=int(acc.get("delay_max", 90)),
+            on_success=on_unfollow,
+            policy="keep_follow_backs",
+        )
+        _backup_current_session(accounts_db, ig)
+        return {
+            "ok": True,
+            "removed": result["unfollowed"],
+            "kept": result["kept"],
+            "skipped": result["skipped"],
+            "errors": result["errors"],
+            "checked": len(candidates),
+        }
 
 
 async def run_unfollow_external_job(username: str):
-    """
-    Faz unfollow de contas que o usuario segue mas que nao seguem de volta.
-    Funciona para follows feitos FORA do bot tambem.
-    """
-    import asyncio
-    from database.accounts import AccountsDB
-    from database.operations import DB
-    from instagram.client import InstagramClient
-    from instagram.unfollower import Unfollower
-    from instagram.score import WhitelistFilter
+    result = await asyncio.to_thread(_run_unfollow_external_sync, username)
+    if not result.get("ok"):
+        await _notify(
+            f"❌ Unfollow externo de @{username} cancelado: {result.get('error', 'erro')}"
+        )
+        return result
+    if result.get("limit_reached"):
+        await _notify(f"ℹ️ @{username}: limite diario de unfollows ja atingido.")
+        return result
+    await _notify(
+        f"✅ Unfollow externo — @{username}\n"
+        f"Removidos: *{result.get('removed', 0)}* | "
+        f"Mantidos: *{result.get('kept', 0)}* | "
+        f"Nao confirmados: *{result.get('skipped', 0)}*"
+    )
+    return result
 
-    adb = AccountsDB()
-    db  = DB()
-    acc = adb.get_account(username)
-    if not acc:
-        return
 
-    # Restaurar sessao
-    ig = InstagramClient(username, acc.get("password", ""), acc.get("fingerprint"))
-    sess = adb.load_session_backup(username)
-    sessao_valida = False
-    if sess:
-        ig.load_session_from_data(sess)
-        sessao_valida = ig.is_logged_in()
-    if not sessao_valida:
-        risk_detector.notify_session_expired(username)
-        return
+# ─── Scheduler ───────────────────────────────────────────────
 
-    # Buscar quem segue no Instagram via API
+
+def setup_scheduler(telegram_app=None) -> AsyncIOScheduler:
+    global _telegram_app
+    _telegram_app = telegram_app
+
     try:
-        following_raw = ig.api.user_following(ig.api.user_id)
-        following_ids = {str(uid) for uid in following_raw.keys()}
-    except Exception as e:
-        await _notify(f"❌ Erro ao buscar following de @{username}: {e}")
-        return
-
-    # Buscar quem segue de volta
-    follow_backs = {
-        r["target_user_id"]
-        for r in (db.sb.table("ig_followed")
-            .select("target_user_id")
-            .eq("account_id", acc["id"])
-            .eq("follows_back", True)
-            .execute().data or [])
-    }
-
-    # Quem nao segue de volta
-    nao_seguem = following_ids - follow_backs
-    if not nao_seguem:
-        await _notify(f"✅ @{username} — nenhum nao-seguidor encontrado.")
-        return
-
-    await _notify(
-        f"🔄 Iniciando unfollow de *{len(nao_seguem)}* nao-seguidores "
-        f"de @{username}..."
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    risk_detector.set_notify_fn(_notify, loop=loop)
+    risk_detector.set_persistence(
+        load_fn=lambda username: BotStateDB().get_json(f"risk:{username}", {}),
+        save_fn=lambda username, data: BotStateDB().set_json(
+            f"risk:{username}", data
+        ),
     )
 
-    wl = WhitelistFilter(db.get_whitelist(acc["id"]))
-    unfollower = Unfollower(ig, risk_detector, wl)
-
-    # Montar lista de candidatos no formato esperado
-    candidates = [
-        {"target_user_id": uid, "target_username": following_raw.get(int(uid), type("u", (), {"username": uid})()).username}
-        for uid in nao_seguem
-    ]
-
-    count = 0
-    for c in candidates:
-        if risk_detector.is_paused(username):
-            break
-        try:
-            ig.api.user_unfollow(c["target_user_id"])
-            db.mark_unfollowed(acc["id"], c["target_username"])
-            db.log_action(acc["id"], "unfollow", c["target_username"], success=True)
-            count += 1
-            import time, random
-            time.sleep(random.uniform(
-                acc.get("delay_min", 30),
-                acc.get("delay_max", 90)
-            ))
-        except Exception as e:
-            logger.error(f"[{username}] Erro unfollow externo {c['target_username']}: {e}")
-            db.log_action(acc["id"], "unfollow", c["target_username"], success=False)
-
-    await _notify(
-        f"✅ Unfollow externo concluído — *{count}* pessoas removidas de @{username}."
+    scheduler = AsyncIOScheduler(
+        timezone="America/Sao_Paulo",
+        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300},
     )
+
+    # Follow: a cada 40 minutos; cada conta ainda respeita sua propria janela.
+    scheduler.add_job(run_follow_job, CronTrigger(minute="*/40"), id="follow_job")
+    scheduler.add_job(
+        run_unfollow_job, CronTrigger(hour=9, minute=30), id="unfollow_job"
+    )
+    # Follow-backs sao checados uma vez ao dia, nao apos cada ciclo/manual.
+    scheduler.add_job(
+        run_auto_unfollow_follow_backs,
+        CronTrigger(hour=18, minute=30),
+        id="auto_unfollow_follow_backs",
+    )
+    scheduler.add_job(
+        run_weekly_report,
+        CronTrigger(day_of_week="sun", hour=20, minute=0),
+        id="weekly_report",
+    )
+    scheduler.add_job(
+        run_session_backup_job, CronTrigger(hour="*/6"), id="session_backup"
+    )
+    scheduler.add_job(
+        run_warmup_job, CronTrigger(hour=23, minute=59), id="warmup_job"
+    )
+    scheduler.add_job(
+        run_anomaly_check, CronTrigger(minute="*/30"), id="anomaly_check"
+    )
+    scheduler.add_job(
+        run_daily_report_job, CronTrigger(hour=22, minute=15), id="daily_report"
+    )
+    return scheduler

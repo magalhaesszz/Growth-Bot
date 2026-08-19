@@ -1,141 +1,23 @@
 import json
 import logging
 from datetime import datetime, timezone
-from cryptography.fernet import Fernet
-from supabase import create_client, Client
+from pathlib import Path
 
-from config import SUPABASE_URL, SUPABASE_KEY, SESSION_ENCRYPTION_KEY
+from cryptography.fernet import Fernet, InvalidToken
+from supabase import Client, create_client
+
+from config import SESSION_ENCRYPTION_KEY, SUPABASE_KEY, SUPABASE_URL
 
 logger = logging.getLogger(__name__)
 
-# ─── SQL: rode no Supabase SQL Editor para criar as tabelas ──
-SCHEMA_SQL = """
--- Contas Instagram gerenciadas
-CREATE TABLE IF NOT EXISTS ig_accounts (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username        TEXT UNIQUE NOT NULL,
-    password_enc    TEXT NOT NULL,             -- senha criptografada
-    session_data    JSONB,                     -- sessão criptografada (backup)
-    fingerprint     JSONB,                     -- dispositivo simulado
-    status          TEXT DEFAULT 'active',     -- active | paused | banned | warming
-    warmup_day      INTEGER DEFAULT 0,         -- dia atual do aquecimento (0 = fora)
-    daily_follows   INTEGER DEFAULT 40,
-    daily_unfollows INTEGER DEFAULT 40,
-    hour_start      INTEGER DEFAULT 8,
-    hour_end        INTEGER DEFAULT 22,
-    delay_min       INTEGER DEFAULT 30,
-    delay_max       INTEGER DEFAULT 90,
-    score_min       INTEGER DEFAULT 50,
-    unfollow_after_days INTEGER DEFAULT 5,
-    unfollow_policy TEXT DEFAULT 'keep_follow_backs',
-    daily_report_enabled BOOLEAN DEFAULT TRUE,
-    created_at      TIMESTAMPTZ DEFAULT now(),
-    last_active_at  TIMESTAMPTZ
-);
+_SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+try:
+    SCHEMA_SQL = _SCHEMA_PATH.read_text(encoding="utf-8")
+except OSError:
+    SCHEMA_SQL = ""
 
--- Perfis seguidos por cada conta
-CREATE TABLE IF NOT EXISTS ig_followed (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    target_user_id  TEXT NOT NULL,
-    target_username TEXT NOT NULL,
-    campaign_id     UUID,
-    followed_at     TIMESTAMPTZ DEFAULT now(),
-    unfollowed_at   TIMESTAMPTZ,
-    follows_back    BOOLEAN DEFAULT FALSE,
-    score           INTEGER,
-    status          TEXT DEFAULT 'following'   -- following | unfollowed | whitelisted
-);
-
--- Páginas-alvo de scraping
-CREATE TABLE IF NOT EXISTS ig_targets (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    page_url        TEXT NOT NULL,
-    page_username   TEXT,
-    page_user_id    TEXT,
-    priority        INTEGER DEFAULT 1,
-    campaign_id     UUID,
-    scraped_count   INTEGER DEFAULT 0,
-    last_scraped_at TIMESTAMPTZ,
-    status          TEXT DEFAULT 'active',
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
--- Campanhas (agrupamento de períodos de ação)
-CREATE TABLE IF NOT EXISTS ig_campaigns (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    name            TEXT NOT NULL,
-    nicho           TEXT,
-    started_at      TIMESTAMPTZ DEFAULT now(),
-    ended_at        TIMESTAMPTZ,
-    total_follows   INTEGER DEFAULT 0,
-    total_unfollows INTEGER DEFAULT 0,
-    total_follow_backs INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'active'
-);
-
--- Whitelist (nunca deixar de seguir)
-CREATE TABLE IF NOT EXISTS ig_whitelist (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    target_username TEXT NOT NULL,
-    added_at        TIMESTAMPTZ DEFAULT now()
-);
-
--- Blacklist (nunca seguir)
-CREATE TABLE IF NOT EXISTS ig_blacklist (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    term            TEXT NOT NULL,             -- username ou palavra-chave
-    type            TEXT DEFAULT 'username',   -- username | keyword
-    added_at        TIMESTAMPTZ DEFAULT now()
-);
-
--- Log de ações
-CREATE TABLE IF NOT EXISTS ig_action_logs (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    action          TEXT NOT NULL,             -- follow | unfollow | story_view | error
-    target_username TEXT,
-    detail          TEXT,
-    success         BOOLEAN DEFAULT TRUE,
-    executed_at     TIMESTAMPTZ DEFAULT now()
-);
-
--- Log de auditoria de acoes administrativas
-CREATE TABLE IF NOT EXISTS audit_log (
-    id          BIGSERIAL PRIMARY KEY,
-    actor_id    BIGINT NOT NULL,
-    actor_username TEXT DEFAULT '?',
-    action      TEXT NOT NULL,
-    target      TEXT DEFAULT '',
-    created_at  TIMESTAMPTZ DEFAULT now()
-);
-
--- Usuarios autorizados no bot Telegram
-CREATE TABLE IF NOT EXISTS bot_users (
-    user_id     BIGINT PRIMARY KEY,
-    username    TEXT DEFAULT '?',
-    name        TEXT DEFAULT '?',
-    added_at    TEXT,
-    is_admin    BOOLEAN DEFAULT FALSE,
-    created_at  TIMESTAMPTZ DEFAULT now()
-);
-
--- Fila de ações com retry
-CREATE TABLE IF NOT EXISTS ig_action_queue (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID REFERENCES ig_accounts(id) ON DELETE CASCADE,
-    action          TEXT NOT NULL,
-    payload         JSONB NOT NULL,
-    retries         INTEGER DEFAULT 0,
-    next_attempt_at TIMESTAMPTZ DEFAULT now(),
-    status          TEXT DEFAULT 'pending',    -- pending | processing | done | failed
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-"""
+_ALLOWED_STATUSES = {"active", "paused", "banned", "warming"}
+_ALLOWED_POLICIES = {"remove_all", "keep_follow_backs", "remove_only_follow_backs"}
 
 
 def _fernet() -> Fernet:
@@ -143,68 +25,147 @@ def _fernet() -> Fernet:
 
 
 def _encrypt(text: str) -> str:
-    return _fernet().encrypt(text.encode()).decode()
+    return _fernet().encrypt(str(text).encode()).decode()
 
 
 def _decrypt(token: str) -> str:
     return _fernet().decrypt(token.encode()).decode()
 
 
+def _validate_combined_settings(settings: dict) -> dict:
+    """Valida configuracoes em um unico ponto para comandos e painel."""
+    data = dict(settings)
+
+    integer_ranges = {
+        "daily_follows": (0, 200),
+        "daily_unfollows": (0, 200),
+        "hour_start": (0, 23),
+        "hour_end": (1, 24),
+        "delay_min": (5, 600),
+        "delay_max": (5, 600),
+        "score_min": (0, 100),
+        "unfollow_after_days": (1, 365),
+    }
+    for key, (minimum, maximum) in integer_ranges.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, bool):
+            raise ValueError(f"{key} deve ser numero inteiro")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} deve ser numero inteiro") from exc
+        if parsed < minimum or parsed > maximum:
+            raise ValueError(f"{key} deve estar entre {minimum} e {maximum}")
+        data[key] = parsed
+
+    if data.get("hour_start", 8) >= data.get("hour_end", 22):
+        raise ValueError("hour_start deve ser menor que hour_end")
+    if data.get("delay_min", 30) > data.get("delay_max", 90):
+        raise ValueError("delay_min nao pode ser maior que delay_max")
+
+    if "unfollow_policy" in data:
+        policy = str(data["unfollow_policy"])
+        if policy not in _ALLOWED_POLICIES:
+            raise ValueError("unfollow_policy invalida")
+        data["unfollow_policy"] = policy
+
+    if "daily_report_enabled" in data:
+        value = data["daily_report_enabled"]
+        if not isinstance(value, bool):
+            raise ValueError("daily_report_enabled deve ser booleano")
+
+    return data
+
+
 class AccountsDB:
     def __init__(self):
         self.sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+    def _decode_row(self, row: dict) -> dict:
+        item = dict(row)
+        token = item.get("password_enc")
+        if token:
+            try:
+                item["password"] = _decrypt(token)
+            except (InvalidToken, ValueError, TypeError):
+                logger.error(
+                    "Nao foi possivel descriptografar a senha de @%s.",
+                    item.get("username", "?"),
+                )
+                item["password"] = ""
+        else:
+            item["password"] = ""
+        return item
+
     # ─── CRUD contas ─────────────────────────────────────────
 
-    def add_account(self, username: str, password: str, fingerprint: dict = None) -> dict:
+    def add_account(
+        self, username: str, password: str, fingerprint: dict | None = None
+    ) -> dict:
+        username = username.strip().lstrip("@")
+        existing = (
+            self.sb.table("ig_accounts")
+            .select("*")
+            .eq("username", username)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            # SESSIONID novo nao pode apagar uma senha que ja estava armazenada.
+            payload = {}
+            if password:
+                payload["password_enc"] = _encrypt(password)
+            if fingerprint is not None:
+                payload["fingerprint"] = fingerprint
+            if payload:
+                res = (
+                    self.sb.table("ig_accounts")
+                    .update(payload)
+                    .eq("username", username)
+                    .execute()
+                )
+                row = res.data[0] if res.data else {**existing.data[0], **payload}
+            else:
+                row = existing.data[0]
+            logger.info("Conta atualizada sem resetar estado: %s", username)
+            return self._decode_row(row)
+
         data = {
             "username": username,
-            "password_enc": _encrypt(password),
+            "password_enc": _encrypt(password or ""),
             "fingerprint": fingerprint,
             "status": "warming",
             "warmup_day": 1,
         }
-        existing = self.sb.table("ig_accounts").select("id").eq(
-            "username", username
-        ).limit(1).execute()
-        if existing.data:
-            res = self.sb.table("ig_accounts").update({
-                "password_enc": data["password_enc"],
-                "fingerprint": fingerprint,
-            }).eq("username", username).execute()
-            logger.info("Credenciais atualizadas para: %s", username)
-        else:
-            res = self.sb.table("ig_accounts").insert(data).execute()
-            logger.info("Conta adicionada: %s", username)
-        return res.data[0] if res.data else {}
+        res = self.sb.table("ig_accounts").insert(data).execute()
+        logger.info("Conta adicionada: %s", username)
+        return self._decode_row(res.data[0]) if res.data else {}
 
     def get_account_by_id(self, account_id: str) -> dict | None:
-        res = self.sb.table("ig_accounts").select("*").eq("id", account_id).execute()
-        if res.data:
-            res.data[0]["password"] = _decrypt(res.data[0]["password_enc"])
-            return res.data[0]
-        return None
+        res = (
+            self.sb.table("ig_accounts")
+            .select("*")
+            .eq("id", account_id)
+            .limit(1)
+            .execute()
+        )
+        return self._decode_row(res.data[0]) if res.data else None
 
     def get_account(self, username: str) -> dict | None:
         res = (
             self.sb.table("ig_accounts")
             .select("*")
-            .eq("username", username)
+            .eq("username", username.strip().lstrip("@"))
+            .limit(1)
             .execute()
         )
-        if res.data:
-            row = res.data[0]
-            row["password"] = _decrypt(row["password_enc"])
-            return row
-        return None
+        return self._decode_row(res.data[0]) if res.data else None
 
     def list_accounts(self) -> list[dict]:
         res = self.sb.table("ig_accounts").select("*").execute()
-        accounts = []
-        for row in res.data:
-            row["password"] = _decrypt(row["password_enc"])
-            accounts.append(row)
-        return accounts
+        return [self._decode_row(row) for row in (res.data or [])]
 
     def list_active_accounts(self) -> list[dict]:
         res = (
@@ -213,14 +174,28 @@ class AccountsDB:
             .in_("status", ["active", "warming"])
             .execute()
         )
-        accounts = []
-        for row in res.data:
-            row["password"] = _decrypt(row["password_enc"])
-            accounts.append(row)
-        return accounts
+        return [self._decode_row(row) for row in (res.data or [])]
 
     def update_status(self, username: str, status: str):
-        self.sb.table("ig_accounts").update({"status": status}).eq("username", username).execute()
+        if status not in _ALLOWED_STATUSES:
+            raise ValueError(f"Status invalido: {status}")
+        username = username.strip().lstrip("@")
+        self.sb.table("ig_accounts").update({"status": status}).eq(
+            "username", username
+        ).execute()
+        # Um comando explicito para voltar a 'active' tambem deve limpar a
+        # pausa em memoria/persistida do detector de risco.
+        if status == "active":
+            try:
+                from instagram.risk_detector import risk_detector
+
+                risk_detector.resume(username)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Status ativo salvo, mas risco nao foi limpo: %s",
+                    username,
+                    type(exc).__name__,
+                )
 
     def update_last_active(self, username: str):
         self.sb.table("ig_accounts").update(
@@ -229,37 +204,65 @@ class AccountsDB:
 
     def update_settings(self, username: str, settings: dict):
         allowed = {
-            "daily_follows", "daily_unfollows", "hour_start", "hour_end",
-            "delay_min", "delay_max", "score_min", "unfollow_after_days",
-            "unfollow_policy", "daily_report_enabled",
+            "daily_follows",
+            "daily_unfollows",
+            "hour_start",
+            "hour_end",
+            "delay_min",
+            "delay_max",
+            "score_min",
+            "unfollow_after_days",
+            "unfollow_policy",
+            "daily_report_enabled",
         }
-        payload = {k: v for k, v in settings.items() if k in allowed}
-        self.sb.table("ig_accounts").update(payload).eq("username", username).execute()
+        requested = {key: value for key, value in settings.items() if key in allowed}
+        if not requested:
+            return
+
+        current = self.get_account(username)
+        if not current:
+            raise ValueError("Conta nao encontrada")
+        combined = {key: current.get(key) for key in allowed}
+        combined.update(requested)
+        validated = _validate_combined_settings(combined)
+        payload = {key: validated[key] for key in requested}
+        self.sb.table("ig_accounts").update(payload).eq(
+            "username", username.strip().lstrip("@")
+        ).execute()
 
     def remove_account(self, username: str):
+        username = username.strip().lstrip("@")
         self.sb.table("ig_accounts").delete().eq("username", username).execute()
-        logger.info(f"Conta removida: {username}")
+        logger.info("Conta removida: %s", username)
 
-    # ─── Backup de sessão ────────────────────────────────────
+    # ─── Backup de sessao ────────────────────────────────────
 
     def save_session_backup(self, username: str, session_data: dict):
-        encrypted = _encrypt(json.dumps(session_data))
+        encrypted = _encrypt(json.dumps(session_data, separators=(",", ":")))
         self.sb.table("ig_accounts").update(
             {"session_data": {"enc": encrypted}}
         ).eq("username", username).execute()
-        logger.debug(f"[{username}] Sessão salva no Supabase.")
+        logger.debug("[%s] Sessao salva no Supabase.", username)
 
     def load_session_backup(self, username: str) -> dict | None:
         res = (
             self.sb.table("ig_accounts")
             .select("session_data")
             .eq("username", username)
+            .limit(1)
             .execute()
         )
         if res.data and res.data[0].get("session_data"):
             enc = res.data[0]["session_data"].get("enc")
             if enc:
-                return json.loads(_decrypt(enc))
+                try:
+                    return json.loads(_decrypt(enc))
+                except (InvalidToken, ValueError, json.JSONDecodeError) as exc:
+                    logger.error(
+                        "[%s] Backup de sessao corrompido/incompativel: %s",
+                        username,
+                        type(exc).__name__,
+                    )
         return None
 
     # ─── Aquecimento ─────────────────────────────────────────
@@ -268,12 +271,14 @@ class AccountsDB:
         acc = self.get_account(username)
         if not acc:
             return 0
-        next_day = acc.get("warmup_day", 1) + 1
-        self.sb.table("ig_accounts").update({"warmup_day": next_day}).eq("username", username).execute()
+        next_day = int(acc.get("warmup_day", 1) or 1) + 1
+        self.sb.table("ig_accounts").update({"warmup_day": next_day}).eq(
+            "username", username
+        ).execute()
         return next_day
 
     def finish_warmup(self, username: str):
         self.sb.table("ig_accounts").update(
             {"warmup_day": 0, "status": "active"}
         ).eq("username", username).execute()
-        logger.info(f"[{username}] Aquecimento concluído. Conta ativa.")
+        logger.info("[%s] Aquecimento concluido. Conta ativa.", username)
