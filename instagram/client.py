@@ -406,6 +406,25 @@ class InstagramClient:
         self.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.cl.dump_settings(str(self.session_path))
 
+        # Uma autenticacao bem-sucedida invalida apenas a pausa causada por
+        # sessao expirada. Outras pausas de risco continuam exigindo revisao.
+        try:
+            from instagram.risk_detector import risk_detector
+
+            status = risk_detector.get_status(self.username)
+            if status["is_paused"] and status["pause_reason"] == "Sessão expirada":
+                risk_detector.resume(self.username)
+                logger.info(
+                    "[%s] Sessao renovada; pausa por sessao expirada removida.",
+                    self.username,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Sessao salva, mas a pausa de risco nao pôde ser atualizada: %s",
+                self.username,
+                type(exc).__name__,
+            )
+
     def save_session(self) -> None:
         self._save_session()
 
