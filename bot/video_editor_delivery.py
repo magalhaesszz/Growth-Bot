@@ -7,6 +7,7 @@ from telegram.ext import (
     ApplicationHandlerStop,
     CallbackQueryHandler,
     ContextTypes,
+    ConversationHandler,
 )
 
 from bot.access import has_access
@@ -58,14 +59,15 @@ async def _send_processed_file(message, path: str, filename: str, size_mb: float
         return False
 
 
-async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Processa o apply e informa se a sessão ativa foi consumida."""
     query = update.callback_query
     if not query:
-        return
+        return False
 
     if not update.effective_user or not has_access(update.effective_user.id):
         await query.answer("Acesso negado.", show_alert=True)
-        return
+        return False
 
     await query.answer()
     raw = query.data or ""
@@ -74,12 +76,12 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     source = ctx.user_data.get("dl_editor_source")
 
     # Um botão de uma sessão antiga não deve processar o vídeo de uma sessão
-    # mais nova nem apagar o estado dela.
+    # mais nova, apagar o estado dela nem encerrar a conversa atual.
     if not source or not stored or token != stored:
         await query.edit_message_text(
             "❌ Sessão do editor expirada. Abra o editor visual novamente."
         )
-        return
+        return False
 
     output_path = ""
     try:
@@ -89,7 +91,7 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(
                 "❌ Editor expirado. Abra o editor novamente, salve e toque em Aplicar."
             )
-            return
+            return True
 
         editor_config = editor.get("config") or {}
         editable = {
@@ -125,7 +127,7 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(
                 f"❌ Falha ao processar vídeo: {result.get('error', 'erro desconhecido')}"
             )
-            return
+            return True
 
         output_path = result["video_path"]
         delivered = await _send_processed_file(
@@ -140,6 +142,7 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(
                 "❌ O vídeo foi processado, mas o Telegram recusou o envio. Tente novamente."
             )
+        return True
     except Exception as exc:
         logger.exception("Erro no fluxo de entrega do editor visual: %s", type(exc).__name__)
         try:
@@ -148,6 +151,7 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             )
         except Exception:
             pass
+        return True
     finally:
         if output_path:
             try:
@@ -159,19 +163,49 @@ async def _handle_editor_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 
 
 async def _editor_apply_guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    consumed = False
     try:
-        await _handle_editor_apply(update, ctx)
+        consumed = await _handle_editor_apply(update, ctx)
     finally:
-        # Impede que o ConversationHandler antigo processe o mesmo callback de
-        # novo em outro grupo e dispare um segundo render.
-        raise ApplicationHandlerStop
+        # Este callback agora roda DENTRO do ConversationHandler de vídeo.
+        # Assim o ApplicationHandlerStop também atualiza o estado da conversa:
+        # sessão consumida => END; botão antigo => mantém o estado atual.
+        next_state = ConversationHandler.END if consumed else None
+        raise ApplicationHandlerStop(next_state)
 
 
 def register_video_editor_delivery_guard(app) -> None:
-    app.add_handler(
-        CallbackQueryHandler(
-            _editor_apply_guard,
-            pattern=r"^dl:editor_apply:.+$",
-        ),
-        group=-6,
+    """Insere o apply memory-safe dentro da conversa /download já registrada."""
+    from bot.handlers.video import AGUARDANDO_LINK, on_dl_action
+
+    guard = CallbackQueryHandler(
+        _editor_apply_guard,
+        pattern=r"^dl:editor_apply:.+$",
+    )
+
+    for handler in app.handlers.get(0, []):
+        if not isinstance(handler, ConversationHandler):
+            continue
+
+        state_handlers = handler.states.get(AGUARDANDO_LINK, [])
+        is_download_conversation = any(
+            getattr(state_handler, "callback", None) is on_dl_action
+            for state_handler in state_handlers
+        )
+        if not is_download_conversation:
+            continue
+
+        if any(
+            getattr(state_handler, "callback", None) is _editor_apply_guard
+            for state_handler in state_handlers
+        ):
+            return
+
+        # Precisa vir antes do CallbackQueryHandler genérico ^dl: para que o
+        # editor visual use a entrega por arquivo sem render duplicado.
+        state_handlers.insert(0, guard)
+        return
+
+    raise RuntimeError(
+        "ConversationHandler do /download precisa ser registrado antes do guard do editor."
     )
