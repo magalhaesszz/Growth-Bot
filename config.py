@@ -56,6 +56,29 @@ INSTAGRAM_COUNTRY_CODE = int(os.getenv("INSTAGRAM_COUNTRY_CODE", "55"))
 INSTAGRAM_LOCALE = os.getenv("INSTAGRAM_LOCALE", "pt_BR")
 INSTAGRAM_TIMEZONE_OFFSET = int(os.getenv("INSTAGRAM_TIMEZONE_OFFSET", "-10800"))
 
+# ─── Monitor continuo de Stories ─────────────────────────────
+# Roda 24/7 e independe da janela de follow/unfollow. O tray detecta stories
+# novos rapidamente; uma varredura em rodizio cobre qualquer perfil que o tray
+# omitir. Os limites abaixo controlam somente leitura/seen de stories.
+STORY_MONITOR_ENABLED = os.getenv("STORY_MONITOR_ENABLED", "true").strip().lower() == "true"
+STORY_MONITOR_INTERVAL_SECONDS = max(
+    30, min(900, int(os.getenv("STORY_MONITOR_INTERVAL_SECONDS", "60")))
+)
+STORY_MONITOR_FOLLOWING_REFRESH_SECONDS = max(
+    STORY_MONITOR_INTERVAL_SECONDS,
+    min(86400, int(os.getenv("STORY_MONITOR_FOLLOWING_REFRESH_SECONDS", "900"))),
+)
+STORY_MONITOR_FALLBACK_BATCH = max(
+    1, min(100, int(os.getenv("STORY_MONITOR_FALLBACK_BATCH", "10")))
+)
+STORY_MONITOR_DELAY_MIN = max(
+    0.0, min(10.0, float(os.getenv("STORY_MONITOR_DELAY_MIN", "0.5")))
+)
+STORY_MONITOR_DELAY_MAX = max(
+    STORY_MONITOR_DELAY_MIN,
+    min(15.0, float(os.getenv("STORY_MONITOR_DELAY_MAX", "1.2"))),
+)
+
 # ─── Pasta de sessoes ────────────────────────────────────────
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "").strip() or os.path.join(
     tempfile.gettempdir(), "growth-bot-sessions"
