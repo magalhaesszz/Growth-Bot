@@ -1,7 +1,12 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
+os.environ.setdefault("SUPABASE_KEY", "test-key")
+os.environ.setdefault("VIDEO_SETTINGS_REMOTE", "false")
 
 import video_settings
 
@@ -14,9 +19,12 @@ class VideoSettingsTests(unittest.TestCase):
             "_PATH",
             Path(self.temp.name) / "video-settings.json",
         )
+        self.remote_patch = patch.object(video_settings, "VIDEO_SETTINGS_REMOTE", False)
         self.path_patch.start()
+        self.remote_patch.start()
 
     def tearDown(self):
+        self.remote_patch.stop()
         self.path_patch.stop()
         self.temp.cleanup()
 
