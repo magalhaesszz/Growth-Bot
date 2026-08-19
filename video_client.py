@@ -3,18 +3,45 @@ import logging
 
 import httpx
 
-from config import VIDEO_API_SECRET, VIDEO_API_URL
+from config import (
+    VIDEO_API_SECRET,
+    VIDEO_API_URL,
+    VIDEO_MAX_BATCH_MB,
+    VIDEO_MAX_FILE_MB,
+)
 
 logger = logging.getLogger(__name__)
 
 HEADERS = {"x-api-secret": VIDEO_API_SECRET}
 TIMEOUT = httpx.Timeout(300.0, connect=15.0)
+_MB = 1024 * 1024
 
 
 def _check_configured() -> None:
     if not VIDEO_API_URL or not VIDEO_API_SECRET:
+        raise ValueError("VIDEO_API_URL e VIDEO_API_SECRET não configurados no servidor.")
+
+
+def _size_mb(data: bytes) -> float:
+    return len(data) / _MB
+
+
+def _validate_video_size(data: bytes, label: str = "video") -> None:
+    size = _size_mb(data)
+    if size > VIDEO_MAX_FILE_MB:
         raise ValueError(
-            "VIDEO_API_URL e VIDEO_API_SECRET não configurados no servidor."
+            f"{label} tem {size:.1f} MB; limite seguro deste bot: {VIDEO_MAX_FILE_MB} MB."
+        )
+
+
+def _validate_batch_size(videos: list[tuple[bytes, str]]) -> None:
+    total = 0.0
+    for data, name in videos:
+        _validate_video_size(data, name)
+        total += _size_mb(data)
+    if total > VIDEO_MAX_BATCH_MB:
+        raise ValueError(
+            f"Lote tem {total:.1f} MB; limite seguro: {VIDEO_MAX_BATCH_MB} MB."
         )
 
 
@@ -76,6 +103,7 @@ def processar_video(
 ) -> dict:
     try:
         _check_configured()
+        _validate_video_size(video_bytes, filename)
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
                 f"{VIDEO_API_URL}/api/v1/processar",
@@ -85,6 +113,7 @@ def processar_video(
             )
         if not response.is_success:
             return {"ok": False, "error": _response_error(response)}
+        _validate_video_size(response.content, "video processado")
         disposition = response.headers.get("content-disposition", "")
         output_name = filename
         if "filename=" in disposition:
@@ -93,7 +122,7 @@ def processar_video(
             "ok": True,
             "video_bytes": response.content,
             "filename": output_name,
-            "size_mb": round(len(response.content) / (1024 * 1024), 2),
+            "size_mb": round(_size_mb(response.content), 2),
         }
     except Exception as exc:
         return _error(exc)
@@ -107,6 +136,7 @@ def gerar_preview(
 ) -> dict:
     try:
         _check_configured()
+        _validate_video_size(video_bytes, filename)
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
                 f"{VIDEO_API_URL}/api/v1/preview",
@@ -129,6 +159,7 @@ def criar_editor_session(
 ) -> dict:
     try:
         _check_configured()
+        _validate_video_size(video_bytes, filename)
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
                 f"{VIDEO_API_URL}/api/v1/editor/session",
@@ -165,6 +196,7 @@ def processar_lote(
 ) -> dict:
     try:
         _check_configured()
+        _validate_batch_size(videos)
         files = [("videos", (name, data, "video/mp4")) for data, name in videos]
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
@@ -180,16 +212,22 @@ def processar_lote(
         return _error(exc)
 
 
-def download_lote_video(job_id: str) -> bytes | None:
+def _download_result(path: str) -> bytes | None:
     try:
         _check_configured()
         with httpx.Client(timeout=TIMEOUT) as client:
-            response = client.get(
-                f"{VIDEO_API_URL}/api/v1/download/{job_id}", headers=HEADERS
-            )
-        return response.content if response.is_success else None
-    except Exception:
+            response = client.get(path, headers=HEADERS)
+        if not response.is_success:
+            return None
+        _validate_video_size(response.content, "video retornado")
+        return response.content
+    except Exception as exc:
+        logger.warning("Download da Video API falhou: %s", type(exc).__name__)
         return None
+
+
+def download_lote_video(job_id: str) -> bytes | None:
+    return _download_result(f"{VIDEO_API_URL}/api/v1/download/{job_id}")
 
 
 def api_status() -> dict:
@@ -222,9 +260,7 @@ def limpar_tmp() -> dict:
     try:
         _check_configured()
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            response = client.delete(
-                f"{VIDEO_API_URL}/api/v1/limpar", headers=HEADERS
-            )
+            response = client.delete(f"{VIDEO_API_URL}/api/v1/limpar", headers=HEADERS)
         if response.is_success:
             return response.json()
         return {"ok": False, "error": _response_error(response)}
@@ -233,7 +269,6 @@ def limpar_tmp() -> dict:
 
 
 def download_link(url: str) -> dict:
-    """Baixa video do Instagram/TikTok e retorna os bytes diretamente."""
     try:
         _check_configured()
         with httpx.Client(timeout=TIMEOUT) as client:
@@ -244,30 +279,20 @@ def download_link(url: str) -> dict:
             )
         if not response.is_success:
             return {"ok": False, "error": _response_error(response)}
+        _validate_video_size(response.content, "video baixado")
         filename = response.headers.get("X-Filename", "video.mp4")
-        size_mb  = float(response.headers.get("X-Size-MB", "0"))
         return {
-            "ok":          True,
+            "ok": True,
             "video_bytes": response.content,
-            "filename":    filename,
-            "size_mb":     size_mb,
+            "filename": filename,
+            "size_mb": round(_size_mb(response.content), 2),
         }
     except Exception as exc:
         return _error(exc)
 
 
 def buscar_video_baixado(job_id: str) -> bytes | None:
-    """Baixa o vídeo já processado pelo job_id."""
-    try:
-        _check_configured()
-        with httpx.Client(timeout=TIMEOUT) as client:
-            response = client.get(
-                f"{VIDEO_API_URL}/api/v1/download/{job_id}",
-                headers=HEADERS,
-            )
-        return response.content if response.is_success else None
-    except Exception:
-        return None
+    return _download_result(f"{VIDEO_API_URL}/api/v1/download/{job_id}")
 
 
 def editar_video(
@@ -280,9 +305,9 @@ def editar_video(
     speed: float = 0.0,
     flip: bool = False,
 ) -> dict:
-    """Aplica marca d'água, legenda e/ou corte ao vídeo."""
     try:
         _check_configured()
+        _validate_video_size(video_bytes, filename)
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
                 f"{VIDEO_API_URL}/api/v1/editar",
@@ -299,12 +324,12 @@ def editar_video(
             )
         if not response.is_success:
             return {"ok": False, "error": _response_error(response)}
-        size_mb = round(len(response.content) / (1024 * 1024), 2)
+        _validate_video_size(response.content, "video editado")
         return {
             "ok": True,
             "video_bytes": response.content,
             "filename": f"editado_{filename}",
-            "size_mb": size_mb,
+            "size_mb": round(_size_mb(response.content), 2),
         }
     except Exception as exc:
         return _error(exc)
