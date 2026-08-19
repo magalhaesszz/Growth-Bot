@@ -6,9 +6,8 @@ from bot.extra_handlers import register_extra_handlers
 from bot.handlers.contas import register_contas_handlers
 from bot.handlers.dashboard import register_dashboard_handlers
 from bot.handlers.operacoes import register_operacoes_handlers
-from bot.handlers.video import register_video_handlers
+from bot.handlers.video_bulk import register_video_handlers
 from bot.runtime_guards import register_runtime_guards
-from bot.video_editor_delivery import register_video_editor_delivery_guard
 from config import TELEGRAM_TOKEN, validate_config
 from scheduler.jobs import setup_scheduler
 from scheduler.story_monitor import attach_story_monitor
@@ -98,10 +97,6 @@ def main():
     register_operacoes_handlers(app)
     register_extra_handlers(app)
     register_video_handlers(app)
-
-    # O apply do editor precisa rodar dentro do ConversationHandler de /download.
-    # Assim a entrega termina a conversa automaticamente sem exigir /cancelar.
-    register_video_editor_delivery_guard(app)
 
     logger.info("Bot rodando.")
     app.run_polling(drop_pending_updates=True)
