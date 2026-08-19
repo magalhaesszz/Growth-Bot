@@ -28,6 +28,10 @@ Opcionais relevantes:
 - `VIDEO_MAX_FILE_MB=45` limita um único vídeo antes de carregá-lo/processá-lo em memória.
 - `VIDEO_MAX_BATCH_MB=120` limita a soma de um lote.
 - `VIDEO_SETTINGS_REMOTE=true` persiste as configurações do editor na tabela `video_settings`; o arquivo em `/tmp` fica apenas como cache/fallback.
+- `STORY_MONITOR_ENABLED=true` mantém a visualização contínua de stories ativa.
+- `STORY_MONITOR_INTERVAL_SECONDS=60` define a frequência do monitor; valores abaixo de 30s são limitados automaticamente.
+- `STORY_MONITOR_FOLLOWING_REFRESH_SECONDS=900` atualiza a lista real de perfis seguidos.
+- `STORY_MONITOR_FALLBACK_BATCH=10` controla quantos seguidos entram na varredura direta de garantia por ciclo.
 
 ## Sessões e risco
 
@@ -37,11 +41,19 @@ Uma sessão expirada pausa a conta e gera **uma única notificação** até que 
 
 O estado de risco é persistido em `bot_state`, portanto um restart não deve liberar silenciosamente uma conta pausada. Os alertas disparados dentro de workers/threads são encaminhados ao event loop principal do Telegram.
 
+## Monitor contínuo de Stories
+
+O monitor de stories roda **24 horas por dia** e não depende da janela operacional de follow/unfollow. Ele consulta a lista real de contas que o perfil segue no Instagram, usa o tray privado para priorizar quem acabou de publicar story e mantém uma varredura em round-robin como garantia para cobrir perfis que o tray possa omitir.
+
+Cada story é identificado pelo seu PK. Depois que `story_seen()` confirma a marcação de visualização, esse PK é salvo temporariamente em `bot_state`. Assim, os ciclos seguintes não enviam `seen` repetido para o mesmo story; quando aparece um story novo, o novo PK é detectado e marcado como visto. O cache persiste após restart e é podado automaticamente porque stories antigos deixam de ser relevantes.
+
+O monitor usa um lock próprio e pode continuar verificando stories enquanto um job de follow está nos delays. Ele não altera limites de follow/unfollow e registra no relatório diário somente a quantidade de stories novos efetivamente marcados como vistos.
+
 ## Limites e concorrência
 
 Os limites diários usam o dia civil de `America/Sao_Paulo`, o mesmo fuso do scheduler. O modo manual pode ignorar a janela de horário, mas **não ignora limite diário nem aquecimento**.
 
-As ações de uma mesma conta são serializadas no processo para que follow, unfollow, modo manual e limpeza externa não disputem a mesma sessão/limite ao mesmo tempo. Parar o modo manual usa sinalização cooperativa: o bot termina a chamada de rede que já estiver em andamento e não inicia a próxima ação.
+As ações mutáveis de uma mesma conta são serializadas no processo para que follow, unfollow, modo manual e limpeza externa não disputem a mesma sessão/limite ao mesmo tempo. O monitor de stories usa uma trava separada por ser somente leitura + marcação de `seen`; isso evita que um batch longo de follows impeça o monitor de continuar acompanhando novos stories. Parar o modo manual usa sinalização cooperativa: o bot termina a chamada de rede que já estiver em andamento e não inicia a próxima ação.
 
 A tabela `ig_action_queue` continua disponível para inspeção/uso administrativo, mas o bot não faz retry cego de follow/unfollow. Quando uma chamada externa termina em estado incerto, repetir automaticamente pode duplicar um efeito no Instagram.
 

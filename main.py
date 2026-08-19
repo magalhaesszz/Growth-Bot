@@ -10,6 +10,7 @@ from bot.handlers.video import register_video_handlers
 from bot.runtime_guards import register_runtime_guards
 from config import TELEGRAM_TOKEN, validate_config
 from scheduler.jobs import setup_scheduler
+from scheduler.story_monitor import attach_story_monitor
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -43,6 +44,7 @@ async def _restore_sessions():
 async def post_init(app: Application):
     await _restore_sessions()
     scheduler = setup_scheduler(telegram_app=app)
+    attach_story_monitor(scheduler)
     scheduler.start()
     # Mantem referencia para um shutdown limpo e evita GC acidental.
     app.bot_data["scheduler"] = scheduler

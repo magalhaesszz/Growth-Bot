@@ -2,6 +2,7 @@ import asyncio
 import os
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 os.environ.setdefault(
     "SESSION_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -58,14 +59,18 @@ class RiskDetectorTests(unittest.TestCase):
         self.assertFalse(third.is_paused("conta"))
 
     def test_anomaly_alert_is_deduplicated(self):
+        # Congela o relogio no meio do dia. Usar ``now - 3h`` diretamente deixa
+        # o teste dependente da meia-noite: entre 00h e 02h a acao cai no dia
+        # anterior, e a regra de producao corretamente nao gera anomalia.
+        fixed_now = datetime(2026, 8, 18, 12, 0, tzinfo=LOCAL_TZ)
         detector = RiskDetector()
         state = detector._state("conta")
-        state.last_action_at = (
-            datetime.now(LOCAL_TZ).replace(tzinfo=None) - timedelta(hours=3)
-        )
+        state.last_action_at = fixed_now.replace(tzinfo=None) - timedelta(hours=3)
 
-        self.assertTrue(detector.check_anomaly("conta", 0, 24))
-        self.assertFalse(detector.check_anomaly("conta", 0, 24))
+        with patch("instagram.risk_detector.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = fixed_now
+            self.assertTrue(detector.check_anomaly("conta", 0, 24))
+            self.assertFalse(detector.check_anomaly("conta", 0, 24))
 
     def test_paused_account_does_not_emit_anomaly(self):
         detector = RiskDetector()
