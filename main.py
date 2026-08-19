@@ -89,9 +89,6 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    # Grupo -6: entrega do editor visual antes do ConversationHandler legado.
-    register_video_editor_delivery_guard(app)
-
     # Grupos -5/-4: permissao, limites de memoria e overrides de seguranca.
     register_runtime_guards(app)
 
@@ -101,6 +98,10 @@ def main():
     register_operacoes_handlers(app)
     register_extra_handlers(app)
     register_video_handlers(app)
+
+    # O apply do editor precisa rodar dentro do ConversationHandler de /download.
+    # Assim a entrega termina a conversa automaticamente sem exigir /cancelar.
+    register_video_editor_delivery_guard(app)
 
     logger.info("Bot rodando.")
     app.run_polling(drop_pending_updates=True)
