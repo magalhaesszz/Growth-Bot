@@ -27,10 +27,12 @@ class RuntimeImportTests(unittest.TestCase):
         from bot.handlers.operacoes import register_operacoes_handlers
         from bot.handlers.video import register_video_handlers
         from bot.runtime_guards import register_runtime_guards
+        from bot.video_editor_delivery import register_video_editor_delivery_guard
 
         self.assertTrue(callable(main.main))
 
         app = Application.builder().token("123:test").build()
+        register_video_editor_delivery_guard(app)
         register_runtime_guards(app)
         register_dashboard_handlers(app)
         register_contas_handlers(app)
@@ -39,6 +41,7 @@ class RuntimeImportTests(unittest.TestCase):
         register_video_handlers(app)
 
         # Guards precisam existir antes do dashboard/handlers funcionais.
+        self.assertIn(-6, app.handlers)
         self.assertIn(-5, app.handlers)
         self.assertIn(-4, app.handlers)
         self.assertIn(-1, app.handlers)
