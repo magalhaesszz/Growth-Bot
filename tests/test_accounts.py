@@ -55,10 +55,11 @@ class FakeSupabase:
 
 class AccountsTests(unittest.TestCase):
     def test_empty_sessionid_password_does_not_overwrite_existing_password(self):
+        original_token = _encrypt("senha-original")
         row = {
             "id": "account-1",
             "username": "conta",
-            "password_enc": _encrypt("senha-original"),
+            "password_enc": original_token,
             "fingerprint": {"device": "x"},
             "status": "active",
             "warmup_day": 0,
@@ -68,7 +69,7 @@ class AccountsTests(unittest.TestCase):
 
         result = db.add_account("conta", "", fingerprint=None)
         self.assertEqual(result["password"], "senha-original")
-        self.assertEqual(row["password_enc"], _encrypt("senha-original") if False else row["password_enc"])
+        self.assertEqual(row["password_enc"], original_token)
 
     def test_settings_reject_inverted_delay(self):
         settings = {
