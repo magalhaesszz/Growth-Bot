@@ -218,6 +218,9 @@ async def _process_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE, message, 
 
         process_cfg = dict(cfg)
         visual_item = visual.get(index) or {}
+        for key in ("video_width", "position_x", "position_y"):
+            if key in visual_item:
+                process_cfg[key] = visual_item[key]
         crop = dict(visual_item.get("manual_crop") or {})
         if crop:
             if edits.get("flip") and visual_item.get("source_width"):
@@ -465,8 +468,8 @@ async def on_dl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["dl_editor_token"] = token
         await query.message.reply_text(
             f"🖼️ *Editor em massa — {len(items)} vídeo(s)*\n\n"
-            "Use a faixa superior para trocar de vídeo. Posição/tamanho valem para todos; "
-            "o recorte é individual e aparece imediatamente na aba Posicionar.",
+            "Use a faixa superior para trocar de vídeo. Tamanho, posição e recorte são "
+            "individuais para cada vídeo e aparecem imediatamente na aba Posicionar.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🖐️ Abrir editor", url=result["editor_url"])],
                 [InlineKeyboardButton("✅ Aplicar e processar todos", callback_data=f"dl:editor_apply:{token}")],
